@@ -1,0 +1,48 @@
+# === 项目目录忽略 ===
+# 忽略logs下所有文件
+app/logs/
+# 忽略虚拟环境目录           
+myenv/*
+# 忽略生成文件目录           
+app/generated/
+# Python字节码缓存         
+**/__pycache__/    
+docs/知了社区*
+docs/测试*
+docs/output*
+docs/reply*.json
+app/data/
+
+
+
+# === Python开发 ===
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# === 开发环境 ===
+.env
+.venv/
+.vscode/
+.idea/
+*.iml
+# === 系统文件 ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# === 测试/文档 ===
+htmlcov/
+.coverage
+site/
+
+# IDE 配置文件（可选）
+.vscode/
+.idea/
+
