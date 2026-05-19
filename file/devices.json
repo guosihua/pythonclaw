@@ -1,0 +1,98 @@
+[
+  {
+    "ip": "10.88.142.207",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "2606cbb0-2657-496f-87bc-1a7d0f58e625"
+  },
+  {
+    "ip": "10.88.142.202",
+    "userName": "admin",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "021b13b5-e845-447b-a51d-265a3ead6421"
+  },
+  {
+    "ip": "10.88.142.210",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "6c354cb6-2c93-40ac-9c1d-4b9b4f892581"
+  },
+  {
+    "ip": "10.88.142.209",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "602052cf-06db-4af6-b536-d08f1186efbb"
+  },
+  {
+    "ip": "10.88.142.205",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "ff8e0e9f-dd00-433d-bb5f-9b814bb96e78"
+  },
+  {
+    "ip": "10.88.142.204",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "27c2b8d0-9078-4f51-9230-afc9a614778f"
+  },
+  {
+    "ip": "10.88.142.146",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "cb1d4ef7-2907-499b-a5a4-4a863e35bba3"
+  },
+  {
+    "ip": "10.88.142.136",
+    "userName": "admin@local",
+    "password": "1qaz!QAZ",
+    "port": 23,
+    "protocol": "telnet",
+    "chassisId": "",
+    "deviceName": "",
+    "deviceCategory": "",
+    "deviceModel": "",
+    "deviceId": "dc6f5dcc-d062-411d-9875-b39591e14cc3"
+  }
+]

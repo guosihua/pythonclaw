@@ -72,12 +72,32 @@ class PersistentAgent(Agent):
         self.messages = [initial_system] + saved
 
         # Re-infer which skills were loaded so _use_skill doesn't double-inject
+        logger.info("[PersistentAgent] Scanning %d saved messages for skill activations", len(saved))
         for msg in saved:
             if msg.get("role") == "system":
                 content = msg.get("content", "")
                 m = re.search(r"(?:Skill Enabled|SKILL ACTIVATED):\s*(.+)", content)
                 if m:
-                    self.loaded_skill_names.add(m.group(1).strip().rstrip("]"))
+                    skill_name = m.group(1).strip().rstrip("]")
+                    logger.info("[PersistentAgent] Found skill activation: '%s'", skill_name)
+                    self.loaded_skill_names.add(skill_name)
+                    
+                    # Extract steps from restored skills
+                    try:
+                        from ..core.skill_loader import SkillRegistry
+                        registry = SkillRegistry()
+                        skill = registry.load_skill(skill_name)
+                        if skill:
+                            step_pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
+                            steps = re.findall(step_pattern, skill.instructions)
+                            if steps and not hasattr(self, '_current_skill_steps'):
+                                self._current_skill_steps = steps
+                                logger.info(
+                                    "[PersistentAgent] Restored %d steps for skill '%s'",
+                                    len(steps), skill_name
+                                )
+                    except Exception as exc:
+                        logger.warning("[PersistentAgent] Failed to restore steps for '%s': %s", skill_name, exc)
 
         # Inject a fresh memory snapshot so the LLM sees up-to-date context
         # near the end of the history (not just buried in the system prompt).

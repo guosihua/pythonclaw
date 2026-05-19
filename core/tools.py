@@ -234,12 +234,99 @@ def send_file(path: str, caption: str = "") -> str:
         return f"Error sending file: {exc}"
 
 
+def execute_step_script(script_name: str, mode: str, params: dict) -> str:
+    """Execute a Python script for a troubleshooting step.
+    
+    This function runs the specified Python script in either 'build' or 'analyze' mode.
+    
+    Parameters
+    ----------
+    script_name : str
+        Name of the script file (e.g., 'step1_check_route.py')
+    mode : str
+        Execution mode: 'build' or 'analyze'
+    params : dict
+        Parameters to pass to the script
+        
+    Returns
+    -------
+    str
+        JSON-formatted result from the script
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+    
+    try:
+        # Determine script path - look in skill directories
+        # Scripts are located in templates/skills/{category}/{skill_name}/
+        skill_base = Path(__file__).parent.parent / "templates" / "skills"
+        
+        # Search for the script in all skill directories
+        script_path = None
+        for category_dir in skill_base.iterdir():
+            if category_dir.is_dir():
+                for skill_dir in category_dir.iterdir():
+                    if skill_dir.is_dir():
+                        candidate = skill_dir / script_name
+                        if candidate.exists():
+                            script_path = candidate
+                            break
+                if script_path:
+                    break
+        
+        if not script_path:
+            return json.dumps({"error": f"Script '{script_name}' not found in any skill directory"})
+        
+        # Build command based on mode
+        if mode == "build":
+            cmd = [sys.executable, str(script_path), "build", json.dumps(params)]
+        elif mode == "analyze":
+            # For analyze mode, params should contain response_data
+            response_data = params.get("response_data", "")
+            cmd = [sys.executable, str(script_path), "analyze", response_data]
+        else:
+            return json.dumps({"error": f"Invalid mode: {mode}. Must be 'build' or 'analyze'"})
+        
+        # Execute the script
+        logger.info("[execute_step_script] Running: %s", " ".join(cmd))
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_venv_env()
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error("[execute_step_script] Script failed: %s", error_msg)
+            return json.dumps({"error": f"Script execution failed: {error_msg}"})
+        
+        output = result.stdout.strip()
+        logger.info("[execute_step_script] Script output: %s", output[:200])
+        
+        # Validate that output is valid JSON
+        try:
+            json.loads(output)
+            return output
+        except json.JSONDecodeError:
+            return json.dumps({"error": f"Script returned invalid JSON: {output[:200]}"})
+    
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Script execution timed out (30s limit)"})
+    except Exception as exc:
+        logger.exception("[execute_step_script] Unexpected error")
+        return json.dumps({"error": f"Unexpected error: {str(exc)}"})
+
+
 AVAILABLE_TOOLS: dict[str, callable] = {
     "run_command": run_command,
     "read_file": read_file,
     "write_file": write_file,
     "list_files": list_files,
     "send_file": send_file,
+    "execute_step_script": execute_step_script,
 }
 
 
@@ -329,6 +416,31 @@ SKILL_TOOLS: list[dict] = [
         ),
         {"skill_name": {"type": "string", "description": "Name of the activated skill."}},
         ["skill_name"],
+    ),
+    _fn(
+        "execute_step_script",
+        (
+            "Execute a Python script for a specific troubleshooting step. "
+            "This tool has two modes: 'build' to generate device command data, "
+            "and 'analyze' to analyze device response and determine next step. "
+            "Use this when following a skill's step-by-step workflow."
+        ),
+        {
+            "script_name": {
+                "type": "string",
+                "description": "Name of the Python script (e.g., 'step1_check_route.py')."
+            },
+            "mode": {
+                "type": "string",
+                "description": "Execution mode: 'build' or 'analyze'.",
+                "enum": ["build", "analyze"]
+            },
+            "params": {
+                "type": "object",
+                "description": "Parameters for the script. For 'build' mode, include destination_network/device_info/etc. For 'analyze' mode, include response_data."
+            }
+        },
+        ["script_name", "mode", "params"],
     ),
 ]
 

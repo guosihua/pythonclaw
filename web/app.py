@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,8 @@ def create_app(provider: LLMProvider | None, *, build_provider_fn=None) -> FastA
     # app.add_api_route("/api/skillhub/install", _api_marketplace_install, methods=["POST"])
     app.add_api_route("/api/channels", _api_channels_status, methods=["GET"])
     app.add_api_route("/api/channels/restart", _api_channels_restart, methods=["POST"])
+    # Step analysis endpoint for skill troubleshooting
+    app.add_api_route("/api/step/analyze", _api_step_analyze, methods=["POST"])
     # app.add_api_route("/api/files/clear", _api_clear_files, methods=["POST"])
     # app.add_api_route("/api/files", _api_list_files, methods=["GET"])
     app.add_api_websocket_route("/ws/chat", _ws_chat)
@@ -929,10 +932,137 @@ async def _ws_chat(websocket: WebSocket):
         logger.exception("[Web] WebSocket error")
 
 
-def build_response(sessionId: str, content: str, end: str) -> dict:
-    conversation_id = str(int(time.time() * 1000))
-    data = f"data: {json.dumps({'answerStatus': 'SUCCESS', 'answerType': 'AI_LIST', 'conversationId': conversation_id, 'end': end, 'message': content, 'sessionId': sessionId}, ensure_ascii=False)}\n\n"
+# ── SSE Response Builders ───────────────────────────────────────────────────
+
+def build_response(sessionId: str, content: str, end: str, answerType: str = 'AI_LIST', contextId: str = None, currentStep: int = None, questionNo: str = None) -> dict:
+    """Build SSE response message.
+    
+    Parameters
+    ----------
+    sessionId : Session identifier
+    content : Message content
+    end : Whether this is the last message (True/False)
+    answerType : Type of answer (AI_LIST, STEP_NOTIFICATION, STEP_COMMAND)
+    contextId : Optional context/conversation ID
+    currentStep : Current step number (for step notifications)
+    questionNo : Optional question number
+    """
+    conversation_id = contextId or str(int(time.time() * 1000))
+    
+    if answerType == 'STEP_NOTIFICATION':
+        # Step notification format
+        data = f"data: {json.dumps({'answerType': 'stepName', 'contextEnd': str(end).lower(), 'contextId': conversation_id, 'currentStep': currentStep or 1, 'message': content, 'questionNo': questionNo or '', 'sessionId': sessionId}, ensure_ascii=False)}\n\n"
+    else:
+        # Normal AI response format
+        data = f"data: {json.dumps({'answerStatus': 'SUCCESS', 'answerType': answerType, 'conversationId': conversation_id, 'end': end, 'message': content, 'sessionId': sessionId}, ensure_ascii=False)}\n\n"
+    
     return data
+
+
+def process_step_markers(sessionId: str, text: str, contextId: str = None, questionNo: str = None, step_counter: list = None) -> list[str]:
+    """Process step markers in text and return SSE messages.
+    
+    Detects [STEP_START]...[STEP_END] patterns and converts them to 
+    stepName messages, while sending remaining text as normal AI_LIST messages.
+    Also handles direct JSON stepCommand messages from tool execution.
+    
+    Parameters
+    ----------
+    sessionId : Session identifier
+    text : Text content that may contain step markers or JSON stepCommand
+    contextId : Optional context/conversation ID
+    questionNo : Optional question number
+    step_counter : Mutable list to track step count across calls [current_step]
+    """
+    import re
+    import json as _json
+    
+    if step_counter is None:
+        step_counter = [0]
+    
+    messages = []
+    
+    # Debug: log the input text
+    logger.info("[StepMarker] Processing text: %s", repr(text[:200]))
+    
+    # Check if text is a JSON stepCommand from tool execution
+    try:
+        if text.strip().startswith('{'):
+            parsed = _json.loads(text)
+            if parsed.get("answerType") == "stepCommand":
+                logger.info("[StepMarker] Detected direct stepCommand JSON")
+                # Extract currentStep from the JSON if available
+                current_step = parsed.get("currentStep", step_counter[0] + 1)
+                step_counter[0] = current_step
+                
+                # Extract the actual message data (device commands) from the parsed JSON
+                message_data = parsed.get("message", {})
+                
+                # Build the complete stepCommand response with proper structure
+                conversation_id = contextId or str(int(time.time() * 1000))
+                step_command_data = {
+                    "answerType": "stepCommand",
+                    "contextEnd": "false",
+                    "contextId": conversation_id,
+                    "currentStep": current_step,
+                    "message": message_data,
+                    "questionNo": questionNo or "",
+                    "sessionId": sessionId
+                }
+                
+                # Serialize the complete structure as SSE message
+                sse_message = f"data: {_json.dumps(step_command_data, ensure_ascii=False)}\n\n"
+                messages.append(sse_message)
+                
+                logger.info("[StepMarker] Sending stepCommand for step %d", current_step)
+                return messages
+    except (_json.JSONDecodeError, Exception):
+        pass  # Not a JSON, continue with normal processing
+    
+    # Pattern to match [STEP_START]content[STEP_END]
+    pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
+    
+    matches = list(re.finditer(pattern, text))
+    logger.info("[StepMarker] Found %d step markers", len(matches))
+    
+    last_end = 0
+    for match in matches:
+        # Send any text before the step marker as normal message
+        if match.start() > last_end:
+            normal_text = text[last_end:match.start()]
+            if normal_text.strip():
+                logger.info("[StepMarker] Sending normal text: %s", repr(normal_text[:100]))
+                messages.append(build_response(sessionId, normal_text, False, 'AI_LIST', contextId))
+        
+        # Increment step counter and send step notification
+        step_counter[0] += 1
+        step_name = match.group(1).strip()
+        logger.info("[StepMarker] Sending step %d: %s", step_counter[0], step_name)
+        messages.append(build_response(
+            sessionId, 
+            step_name, 
+            False, 
+            'STEP_NOTIFICATION',
+            contextId,
+            step_counter[0],
+            questionNo
+        ))
+        
+        last_end = match.end()
+    
+    # Send any remaining text after the last step marker
+    if last_end < len(text):
+        remaining_text = text[last_end:]
+        if remaining_text.strip():
+            logger.info("[StepMarker] Sending remaining text: %s", repr(remaining_text[:100]))
+            messages.append(build_response(sessionId, remaining_text, False, 'AI_LIST', contextId))
+    
+    if not messages:
+        logger.info("[StepMarker] No markers found, sending as normal text")
+        return [build_response(sessionId, text, False, 'AI_LIST', contextId)]
+    
+    logger.info("[StepMarker] Total messages generated: %d", len(messages))
+    return messages
 
 
 # ────────────────────────── Chatbot Upload ───────────────────────────────────
@@ -1043,9 +1173,17 @@ async def _sse_chat(request: Request):
         """Generate SSE stream."""
         loop = asyncio.get_event_loop()
         sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        
+        # Generate context ID for this conversation
+        context_id = str(uuid.uuid4())
+        question_no = f"session_{int(time.time() * 1000)}"
+        step_counter = [0]  # Mutable list to track step count
 
         def _on_token(text: str) -> None:
-            loop.call_soon_threadsafe(sse_queue.put_nowait, build_response(sessionId, text, False))
+            # Process step markers and send appropriate messages
+            messages = process_step_markers(sessionId, text, context_id, question_no, step_counter)
+            for msg in messages:
+                loop.call_soon_threadsafe(sse_queue.put_nowait, msg)
 
         chat_input: str | list = message or ""
 
@@ -1055,7 +1193,7 @@ async def _sse_chat(request: Request):
                     None, agent.chat_stream, chat_input, _on_token
                 )
             except Exception as exc:
-                logger.exception("[Web] run_in_executor error", str(exc))
+                logger.exception("[Web] run_in_executor error: %s", str(exc))
             finally:
                 loop.call_soon_threadsafe(sse_queue.put_nowait, None)
 
@@ -1068,7 +1206,7 @@ async def _sse_chat(request: Request):
                     break
                 yield sse_chunk
         except Exception as exc:
-            logger.exception("[Web] SSE chat error", str(exc))
+            logger.exception("[Web] SSE chat error: %s", str(exc))
             if not chat_task.done():
                 chat_task.cancel()
         finally:
@@ -1083,3 +1221,111 @@ async def _sse_chat(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Step Analysis Endpoint ─────────────────────────────────────────────────
+
+async def _api_step_analyze(request: Request):
+    """Analyze device response data using skill step scripts.
+    
+    This endpoint receives device response data and calls the appropriate
+    Python script to analyze it and determine the next troubleshooting step.
+    
+    Expected JSON body:
+    {
+        "script_name": "step1_check_route.py",
+        "response_data": "<raw device response>",
+        "session_id": "optional session identifier"
+    }
+    
+    Returns analysis result with decision logic for the next step.
+    """
+    import subprocess
+    import sys
+    
+    try:
+        body = await request.json()
+        script_name = body.get("script_name", "").strip()
+        response_data = body.get("response_data", "")
+        session_id = body.get("session_id", "")
+        
+        if not script_name:
+            return JSONResponse(
+                {"ok": False, "error": "script_name is required"},
+                status_code=400
+            )
+        
+        if not response_data:
+            return JSONResponse(
+                {"ok": False, "error": "response_data is required"},
+                status_code=400
+            )
+        
+        # Find the script in skill directories
+        skill_base = Path(__file__).parent.parent / "templates" / "skills"
+        script_path = None
+        
+        for category_dir in skill_base.iterdir():
+            if category_dir.is_dir():
+                for skill_dir in category_dir.iterdir():
+                    if skill_dir.is_dir():
+                        candidate = skill_dir / script_name
+                        if candidate.exists():
+                            script_path = candidate
+                            break
+                if script_path:
+                    break
+        
+        if not script_path:
+            return JSONResponse(
+                {"ok": False, "error": f"Script '{script_name}' not found"},
+                status_code=404
+            )
+        
+        # Execute the script in analyze mode
+        cmd = [sys.executable, str(script_path), "analyze", response_data]
+        logger.info("[StepAnalyze] Running: %s", " ".join(cmd))
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error("[StepAnalyze] Script failed: %s", error_msg)
+            return JSONResponse(
+                {"ok": False, "error": f"Analysis failed: {error_msg}"},
+                status_code=500
+            )
+        
+        output = result.stdout.strip()
+        logger.info("[StepAnalyze] Analysis result: %s", output[:200])
+        
+        # Parse and return the result
+        try:
+            analysis_result = json.loads(output)
+            return {
+                "ok": True,
+                "result": analysis_result,
+                "session_id": session_id
+            }
+        except json.JSONDecodeError:
+            return JSONResponse(
+                {"ok": False, "error": f"Invalid JSON from script: {output[:200]}"},
+                status_code=500
+            )
+    
+    except subprocess.TimeoutExpired:
+        return JSONResponse(
+            {"ok": False, "error": "Analysis timed out (30s limit)"},
+            status_code=500
+        )
+    except Exception as exc:
+        logger.exception("[StepAnalyze] Unexpected error")
+        return JSONResponse(
+            {"ok": False, "error": str(exc)},
+            status_code=500
+        )

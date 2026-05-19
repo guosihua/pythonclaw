@@ -123,6 +123,31 @@ def _build_provider():
             ),
         )
 
+    if provider_name in ("h3c", "h3cai"):
+        from .core.llm.h3c_ai_provider import H3CAIProvider
+        return H3CAIProvider(
+            auth_url=config.get_str(
+                "llm", "h3c", "authUrl",
+                default="https://api-ai.h3c.com/session/api/user/login",
+            ),
+            api_endpoint=config.get_str(
+                "llm", "h3c", "apiEndpoint",
+                default="https://api-ai.h3c.com/session/ai/chat/deepseek",
+            ),
+            model_name=config.get_str(
+                "llm", "h3c", "model",
+                default="DEEPSEEK_V3_PRIVATE",
+            ),
+            account=config.get_str(
+                "llm", "h3c", "account",
+                default="ts_sn",
+            ),
+            password=config.get_str(
+                "llm", "h3c", "password",
+                default="ts_sn123",
+            ),
+        )
+
     raise ValueError(f"Unknown LLM_PROVIDER: '{provider_name}'")
 
 
@@ -133,7 +158,11 @@ def _ensure_configured(config_path: str | None = None) -> None:
     from .onboard import needs_onboard, run_onboard
 
     if needs_onboard(config_path):
-        print("没有找到大模型provider和api key\n")
+        provider = config.get_str("llm", "provider", env="LLM_PROVIDER", default="")
+        if provider.lower() in ("h3c", "h3cai"):
+            print("没有找到 H3C AI 的账号配置\n")
+        else:
+            print("没有找到大模型provider和api key\n")
         # run_onboard(config_path)
 
 
@@ -157,8 +186,24 @@ def _cmd_start(args) -> None:
 def _run_foreground(args) -> None:
     """Run the web server (+ optional channels) in the foreground."""
     provider = None
+    provider_name = config.get_str("llm", "provider", env="LLM_PROVIDER", default="deepseek")
+    
     try:
         provider = _build_provider()
+        print(f"\n{'='*60}")
+        print(f"[PythonClaw] LLM Provider: {provider_name.upper()}")
+        
+        if provider_name.lower() in ("h3c", "h3cai"):
+            from .core.llm.h3c_ai_provider import H3CAIProvider
+            if isinstance(provider, H3CAIProvider):
+                print(f"[PythonClaw] ✅ Using H3C Internal AI Platform")
+                print(f"[PythonClaw] Model: {provider.model_name}")
+                print(f"[PythonClaw] Account: {provider.account}")
+                print(f"[PythonClaw] API Endpoint: {provider.api_endpoint}")
+        else:
+            print(f"[PythonClaw] Model: {getattr(provider, 'model_name', 'N/A')}")
+        
+        print(f"{'='*60}\n")
     except Exception as exc:
         print(f"[PythonClaw] Warning: LLM provider not configured ({exc})")
 

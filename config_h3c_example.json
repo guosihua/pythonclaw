@@ -1,0 +1,17 @@
+{
+  "llm": {
+    "provider": "h3c",
+    "h3c": {
+      "account": "ts_sn",
+      "password": "ts_sn123",
+      "model": "DEEPSEEK_V3_PRIVATE",
+      "authUrl": "https://api-ai.h3c.com/session/api/user/login",
+      "apiEndpoint": "https://api-ai.h3c.com/session/ai/chat/deepseek"
+    }
+  },
+  "skills": {},
+  "channels": [],
+  "heartbeat": {
+    "intervalSec": 60
+  }
+}

@@ -752,6 +752,18 @@ Don't repeat this if `bot_name` already exists in memory.
         )
         self.pending_injections.append(injection)
         self.loaded_skill_names.add(skill_name)
+        
+        # Extract step markers from skill instructions for proactive notification
+        import re
+        step_pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
+        steps = re.findall(step_pattern, skill.instructions)
+        if steps:
+            # Store extracted steps for later use in chat_stream
+            self._current_skill_steps = steps
+            logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
+        else:
+            self._current_skill_steps = []
+        
         if self.verbose:
             logger.debug("Skill activated: %s (Level 2 loaded)", skill_name)
 
@@ -898,7 +910,7 @@ Don't repeat this if `bot_name` already exists in memory.
             return False
         # 估计当前消息历史的 token 数量
         tokens = estimate_tokens(self.messages)
-        soft_threshold = int(self.compaction_threshold * 0.8)
+        soft_threshold = int(self.compaction_threshold * 00.8)
 
         # _memory_flushed_this_cycle 本循环周期内，没有刷过内存
         if not self._memory_flushed_this_cycle and tokens >= soft_threshold:
@@ -1129,17 +1141,28 @@ Don't repeat this if `bot_name` already exists in memory.
 
         current_tools = self._build_tools() # 组装当前会话可用的完整工具列表
         tool_rounds = 0
+        skill_step_counter = 0  # Independent counter for skill steps (excludes use_skill)
         chat_start = time.monotonic()
         _t2 = time.monotonic() # 测试用
         _stage_build_tools = int((_t2 - _t1) * 1000) # 测试用
-
-        # 意图识别 + 手册搜索（非闲聊类时，将搜索结果拼接到 user message 末尾）
-        # intent = check_intent(user_input)
-        # if intent is not None and "闲聊类" not in intent:
-        #     manual_result = search_manuals(user_input)
-        #     if manual_result:
-        #         augmented = f"[参考资料]以下是系统搜索到的参考资料，请根据资料回答用户问题。\n{manual_result}\n\n\n\n\n[用户问题]\n{user_input}"
-        #         self.messages[-1]["content"] = augmented
+        
+        # Flag to track if we should suppress conversational text
+        # Always suppress in skill execution scenarios to prevent dialogue leakage
+        suppress_conversational_text = hasattr(self, '_current_skill_steps') and bool(self._current_skill_steps)
+        
+        # Check if user input suggests skill execution (troubleshooting, diagnosis, etc.)
+        # If so, proactively suppress conversational text from the start
+        user_input_lower = ""
+        if isinstance(user_input, str):
+            user_input_lower = user_input.lower()
+        
+        troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由', '不通', 'not working']
+        if any(kw in user_input_lower for kw in troubleshooting_keywords):
+            logger.info("[Agent] Detected troubleshooting intent, enabling text suppression")
+            suppress_conversational_text = True
+        
+        # Note: Initial step notification is handled proactively before tool execution
+        # No need to send it here since steps are extracted during skill activation
         _t3 = time.monotonic() # 测试用
         _stage_intent = int((_t3 - _t2) * 1000) # 测试用
 
@@ -1162,28 +1185,40 @@ Don't repeat this if `bot_name` already exists in memory.
                     try:
                         chunk = next(gen)
                         if chunk.get("type") == "text_delta" and on_token:
-                            if not _first_token_logged: # 测试用
-                                _first_token_logged = True
-                                _t5 = time.monotonic()
-                                _stage_llm_first = int((_t5 - _t4) * 1000)
-                                _stage_total = int((_t5 - _t0) * 1000)
-                                _log_detail({
-                                    "event": "stream_first_token_timing",
-                                    "stages_ms": {
-                                        "input_normalization": _stage_input_norm,
-                                        "build_tools": _stage_build_tools,
-                                        "intent_manual_search": _stage_intent,
-                                        "pre_llm_prep": _stage_pre_llm,
-                                        "llm_first_token": _stage_llm_first,
-                                        "total": _stage_total,
-                                    },
-                                })
-                                logger.info(
-                                    "首token时间 (ms): 多模态处理=%d |  构建工具=%d | 意图和搜索=%d | 构建提示词=%d | 主流程=%d | 总计=%d",
-                                    _stage_input_norm, _stage_build_tools, _stage_intent,
-                                    _stage_pre_llm, _stage_llm_first, _stage_total,
-                                )
-                            on_token(chunk["text"])
+                            # Skip sending text to frontend when skill is active or tool calls detected
+                            # Only send step notifications (handled separately)
+                            should_suppress = (
+                                suppress_conversational_text or 
+                                (hasattr(self, '_current_skill_steps') and self._current_skill_steps)
+                            )
+                            
+                            if should_suppress:
+                                # Suppress all streaming text
+                                pass
+                            else:
+                                # No skill active, send text normally
+                                if not _first_token_logged: # 测试用
+                                    _first_token_logged = True
+                                    _t5 = time.monotonic()
+                                    _stage_llm_first = int((_t5 - _t4) * 1000)
+                                    _stage_total = int((_t5 - _t0) * 1000)
+                                    _log_detail({
+                                        "event": "stream_first_token_timing",
+                                        "stages_ms": {
+                                            "input_normalization": _stage_input_norm,
+                                            "build_tools": _stage_build_tools,
+                                            "intent_manual_search": _stage_intent,
+                                            "pre_llm_prep": _stage_pre_llm,
+                                            "llm_first_token": _stage_llm_first,
+                                            "total": _stage_total,
+                                        },
+                                    })
+                                    logger.info(
+                                        "首token时间 (ms): 多模态处理=%d |  构建工具=%d | 意图和搜索=%d | 构建提示词=%d | 主流程=%d | 总计=%d",
+                                        _stage_input_norm, _stage_build_tools, _stage_intent,
+                                        _stage_pre_llm, _stage_llm_first, _stage_total,
+                                    )
+                                on_token(chunk["text"])
                     except StopIteration as si:
                         response = si.value
                         break
@@ -1192,7 +1227,38 @@ Don't repeat this if `bot_name` already exists in memory.
                     return ""
 
                 message = response.choices[0].message
+                # Log the full message content for debugging step markers
+                logger.info("[Agent] LLM response content: %s", repr((message.content or "")[:500]))
+                logger.info("[Agent] LLM has tool_calls: %s", bool(message.tool_calls))
                 print(message)
+
+                # Suppress ALL text content when there are tool calls
+                # This prevents conversational text from being sent to frontend during skill execution
+                if message.tool_calls:
+                    if message.content:
+                        logger.info("[Agent] Suppressing LLM text content (tool calls detected)")
+                        message.content = None
+                    # Set flag to suppress conversational text in subsequent rounds
+                    suppress_conversational_text = True
+
+                # If a skill is active, ensure no text content escapes
+                # The LLM should only call tools, not generate conversational text
+                if hasattr(self, '_current_skill_steps') and self._current_skill_steps:
+                    # Double-check: if no tool calls but skill is active, this is a violation
+                    if not message.tool_calls:
+                        logger.warning("[Agent] LLM did not call any tool while skill is active. Injecting forced tool call prompt.")
+                        # Add the suppressed message to history (convert None to empty string for API compatibility)
+                        msg_dump = message.model_dump()
+                        if msg_dump.get("content") is None:
+                            msg_dump["content"] = ""
+                        self.messages.append(msg_dump)
+                        # Inject a system message to force tool usage
+                        self.messages.append({
+                            "role": "system",
+                            "content": "⚠️ CRITICAL ERROR: You MUST call execute_step_script tool now. Do NOT generate any text. Call the tool immediately with the current step parameters."
+                        })
+                        # Continue to next iteration to force another LLM call
+                        continue
 
                 if not message.tool_calls:
                     self.messages.append(message.model_dump())
@@ -1238,16 +1304,31 @@ Don't repeat this if `bot_name` already exists in memory.
                 tool_calls = message.tool_calls
                 tool_calls = self._cap_parallel_skills(tool_calls)
 
+                # Proactively send step notifications before executing tools
+                if on_token and hasattr(self, '_current_skill_steps') and self._current_skill_steps:
+                    # Only count actual step execution (execute_step_script), not skill activation (use_skill)
+                    is_step_execution = any(
+                        tc.function.name == 'execute_step_script' 
+                        for tc in tool_calls
+                    )
+                    
+                    if is_step_execution:
+                        # Use independent counter for skill steps
+                        current_step_idx = min(skill_step_counter, len(self._current_skill_steps) - 1)
+                        if current_step_idx >= 0:
+                            step_name = self._current_skill_steps[current_step_idx]
+                            step_marker = f"[STEP_START]{step_name}[STEP_END]"
+                            logger.info("[SkillSteps] Sending proactive step notification for step %d: %s", current_step_idx + 1, step_name)
+                            on_token(step_marker)
+                        
+                        # Increment the skill step counter after sending notification
+                        skill_step_counter += 1
+
                 if on_token:
                     names = ", ".join(tc.function.name for tc in tool_calls)
                     arguments = ", ".join(tc.function.arguments for tc in tool_calls)
-                    # on_token(f"`我正在思考，请稍等【{names}】【{arguments}】`\n")
-                    if tool_rounds == 1:
-                        on_token(f"`当前信息我已收到，正在处理`\n")
-                    elif tool_rounds == 2:
-                        on_token(f"`正在查询信息，请稍等`\n")
-                    else:
-                        pass
+                    # Removed fixed messages to allow skill-defined step markers to be sent
+                    pass
 
                 results: dict[str, str] = {}
                 with ThreadPoolExecutor(
@@ -1265,6 +1346,53 @@ Don't repeat this if `bot_name` already exists in memory.
                             results[tc.id] = future.result()
                         except Exception as exc:
                             results[tc.id] = f"Error: {exc}"
+
+                # Send tool execution results to frontend if on_token is available
+                has_step_command = False
+                if on_token:
+                    for tc in tool_calls:
+                        if tc.function.name == 'execute_step_script' and tc.id in results:
+                            try:
+                                import json as _json
+                                result_data = results[tc.id]
+                                # Try to parse as JSON to extract stepCommand
+                                if isinstance(result_data, str):
+                                    parsed = _json.loads(result_data)
+                                    if parsed.get("answerType") == "stepCommand":
+                                        # Send stepCommand to frontend
+                                        logger.info("[Agent] Sending stepCommand to frontend")
+                                        on_token(result_data)
+                                        has_step_command = True
+                            except Exception as e:
+                                logger.warning(f"[Agent] Failed to send stepCommand: {e}")
+
+                # If we sent a stepCommand, pause execution and wait for frontend to send analysis result
+                if has_step_command:
+                    logger.info("[Agent] Pausing execution, waiting for frontend to send step analysis result")
+                    # Add tool results to message history
+                    for tc in tool_calls:
+                        if tc.id not in results:
+                            results[tc.id] = (
+                                f"Error: tool '{tc.function.name}' timed out "
+                                f"after {self.TOOL_TIMEOUT}s"
+                            )
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": results[tc.id],
+                        })
+                    
+                    # Inject pending injections
+                    for injection in self.pending_injections:
+                        self.messages.append(
+                            {"role": "system", "content": injection}
+                        )
+                    self.pending_injections = []
+                    
+                    # Return empty string to indicate pause
+                    # The conversation will continue when frontend sends analysis result
+                    return ""
+
                 for tc in tool_calls:
                     if tc.id not in results:
                         results[tc.id] = (
@@ -1294,5 +1422,11 @@ Don't repeat this if `bot_name` already exists in memory.
                         })
                 continue
             except Exception as exc:
-                logger.error("Critical error in Agent.chat_stream()")
+                import traceback
+                error_details = traceback.format_exc()
+                logger.error(f"Critical error in Agent.chat_stream(): {exc}")
+                logger.error(f"Traceback:\n{error_details}")
                 return f"Error: {exc}"
+
+        # This should never be reached
+        return ""

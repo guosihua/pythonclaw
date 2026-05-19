@@ -80,6 +80,13 @@ PROVIDERS = [
         "default_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "env": "QWEN_API_KEY",
     },
+    {
+        "key": "h3c",
+        "name": "H3C AI (Internal)",
+        "default_model": "DEEPSEEK_V3_PRIVATE",
+        "default_base": None,
+        "env": None,  # Uses account/password instead of API key
+    },
 ]
 
 
@@ -99,7 +106,7 @@ def run_onboard(config_path: str | None = None) -> Path:
     # 1. Choose LLM provider
     provider = _choose_provider(cfg)
 
-    # 2. Enter API key
+    # 2. Enter API key (or credentials for H3C)
     api_key = _get_api_key(provider, cfg)
 
     # 3. Update config
@@ -107,10 +114,35 @@ def run_onboard(config_path: str | None = None) -> Path:
     cfg.setdefault("llm", {})
     cfg["llm"]["provider"] = prov
     cfg["llm"].setdefault(prov, {})
-    cfg["llm"][prov]["apiKey"] = api_key
-    cfg["llm"][prov].setdefault("model", provider["default_model"])
-    if provider["default_base"]:
-        cfg["llm"][prov].setdefault("baseUrl", provider["default_base"])
+    
+    # Special handling for H3C AI - store account/password instead of apiKey
+    if prov in ("h3c", "h3cai"):
+        # For H3C, we stored credentials separately in _get_h3c_credentials
+        # Now we need to retrieve them from user input again or use defaults
+        llm_cfg = cfg.get("llm", {}).get("h3c", {})
+        account = llm_cfg.get("account", "ts_sn")
+        password = llm_cfg.get("password", "ts_sn123")
+        
+        # Re-prompt for credentials if not already set
+        if not llm_cfg.get("account") or not llm_cfg.get("password"):
+            print(f"\n  {_c('H3C AI Configuration', _CYAN)}")
+            account_input = input(f"  Account [ts_sn]: ").strip()
+            if account_input:
+                account = account_input
+            
+            import getpass
+            password_input = getpass.getpass("  Password [ts_sn123]: ").strip()
+            if password_input:
+                password = password_input
+        
+        cfg["llm"][prov]["account"] = account
+        cfg["llm"][prov]["password"] = password
+        # Don't store apiKey for H3C
+    else:
+        cfg["llm"][prov]["apiKey"] = api_key
+        cfg["llm"][prov].setdefault("model", provider["default_model"])
+        if provider["default_base"]:
+            cfg["llm"][prov].setdefault("baseUrl", provider["default_base"])
 
     # 4. Optional keys
     _optional_keys(cfg)
@@ -169,6 +201,10 @@ def _choose_provider(cfg: dict) -> dict:
 
 
 def _get_api_key(provider: dict, cfg: dict) -> str:
+    # Special handling for H3C AI provider (uses account/password instead of API key)
+    if provider["key"] in ("h3c", "h3cai"):
+        return _get_h3c_credentials(provider, cfg)
+    
     existing = cfg.get("llm", {}).get(provider["key"], {}).get("apiKey", "")
     has_existing = bool(existing) and existing != ""
 
@@ -192,12 +228,43 @@ def _get_api_key(provider: dict, cfg: dict) -> str:
         print(_c("  API key is required.", _RED))
         return _get_api_key(provider, cfg)
 
-    if provider["key"] == "claude" and not key.startswith("sk-ant-"):
-        print("  → Setup token set (session auth)")
-    else:
-        print(f"  → Key set ({key[:4]}****)")
-    print()
+    print("  → Key saved")
     return key
+
+
+def _get_h3c_credentials(provider: dict, cfg: dict) -> str:
+    """Get H3C AI credentials (account and password)."""
+    llm_cfg = cfg.get("llm", {}).get("h3c", {})
+    existing_account = llm_cfg.get("account", "")
+    existing_password = llm_cfg.get("password", "")
+    
+    has_existing = bool(existing_account) and bool(existing_password)
+    
+    if has_existing:
+        masked_account = existing_account[:3] + "***" if len(existing_account) > 3 else "***"
+        print(f"  {provider['name']} Credentials")
+        print(_c(f"    Current account: {masked_account} (press Enter to keep)", _DIM))
+    else:
+        print(f"  {provider['name']} Credentials")
+    
+    account = input(f"  Account [{existing_account or 'ts_sn'}]: ").strip()
+    if not account and existing_account:
+        account = existing_account
+    elif not account:
+        account = "ts_sn"
+    
+    password = getpass.getpass(f"  Password [{'*' * 8 if existing_password else 'ts_sn123'}]: ").strip()
+    if not password and existing_password:
+        password = existing_password
+    elif not password:
+        password = "ts_sn123"
+    
+    # Store credentials in config format - we'll return a dummy "api key" 
+    # but actually store account/password separately
+    print("  → Credentials saved")
+    
+    # Return a placeholder since H3C doesn't use API keys
+    return "h3c_credentials_stored"
 
 
 def _optional_keys(cfg: dict) -> None:
@@ -379,7 +446,7 @@ def _save_config(cfg: dict, config_path: str | None) -> Path:
 
 
 def needs_onboard(config_path: str | None = None) -> bool:
-    """ 检查llm和api key """
+    """Check if LLM provider and credentials are configured."""
     try:
         config.load(config_path)
     except Exception:
@@ -389,5 +456,11 @@ def needs_onboard(config_path: str | None = None) -> bool:
     if not provider:
         return True
 
+    # For H3C AI, check account instead of apiKey
+    if provider.lower() in ("h3c", "h3cai"):
+        account = config.get_str("llm", provider, "account", default="")
+        return not account
+    
+    # For other providers, check apiKey
     api_key = config.get_str("llm", provider, "apiKey", default="")
     return not api_key
