@@ -1353,16 +1353,47 @@ Don't repeat this if `bot_name` already exists in memory.
                                     
                                     # Build parameters for the step script
                                     # execute_step_script expects: script_name, mode, params
+                                    # Map step name to analysis_type
+                                    step_to_analysis_type = {
+                                        "检查全局路由表中是否存在该静态路由": "check_route",
+                                        "检查下一跳地址可达性": "check_nexthop",
+                                        "检查路由掩码与最长匹配原则": "check_mask",
+                                        "检查出接口物理与协议状态": "check_interface",
+                                        "检查BFD或NQA配置与状态": "check_bfd",
+                                        "检查本静态路由的优先级": "check_priority"
+                                    }
+                                    analysis_type = step_to_analysis_type.get(first_step_name, "check_route")
+                                    
+                                    # Extract destination network from context or use default
+                                    destination_network = "0.0.0.0/0"  # Default
+                                    for msg in self.messages[-10:]:
+                                        if msg.get("role") == "user":
+                                            content = msg.get("content", "")
+                                            # Try to extract CIDR notation
+                                            import re
+                                            dest_match = re.search(r'([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2})', content)
+                                            if dest_match:
+                                                destination_network = dest_match.group(1)
+                                                logger.info(f"[Agent] Extracted destination_network: {destination_network}")
+                                                break
+                                    
+                                    # Extract device info from context
+                                    device_info = self._extract_device_info_from_context()
                                     step_params = {
                                         "step_name": first_step_name,
                                         "step_number": 1,
-                                        "skill_name": skill_name
+                                        "skill_name": skill_name,
+                                        "analysis_type": analysis_type,
+                                        "destination_network": destination_network,
+                                        "device_info": device_info,
+                                        "context_id": skill_args.get("context_id", ""),
+                                        "question_no": skill_args.get("question_no", "")
                                     }
                                     
                                     # Arguments must match execute_step_script signature: (script_name, mode, params)
                                     step_args_json = json.dumps({
-                                        "script_name": "step1_check_route.py",
-                                        "mode": "build",
+                                        "script_name": "step_executor.py",
+                                        "mode": "build_and_execute",
                                         "params": step_params
                                     })
                                     
@@ -1377,25 +1408,33 @@ Don't repeat this if `bot_name` already exists in memory.
                                     logger.info(f"[Agent] Step execution result (first 200 chars): {step_result[:200]}")
                                     
                                     # Send step notification and command to frontend
+                                    # Send step notification and analysis result to frontend
                                     if on_token:
                                         # Send stepName
                                         step_marker = f"[STEP_START]{first_step_name}[STEP_END]"
                                         logger.info(f"[SkillSteps] Sending proactive step notification for step 1: {first_step_name}")
                                         on_token(step_marker)
                                         
-                                        # Send stepCommand if present in result
+                                        # Send stepAnalysis result (script already executed commands and analyzed)
                                         try:
                                             import json as _json
                                             if isinstance(step_result, str):
                                                 parsed = _json.loads(step_result)
-                                                if parsed.get("answerType") == "stepCommand":
-                                                    logger.info("[Agent] Sending stepCommand to frontend")
+                                                if parsed.get("answerType") == "stepAnalysis":
+                                                    logger.info("[Agent] Sending stepAnalysis to frontend")
+                                                    on_token(step_result)
+                                                elif parsed.get("answerType") == "stepCommand":
+                                                    # Fallback: if still getting stepCommand, log warning
+                                                    logger.warning("[Agent] Received stepCommand instead of stepAnalysis - script may not be executing correctly")
                                                     on_token(step_result)
                                         except Exception as e:
                                             logger.warning(f"[Agent] Failed to parse step result: {e}")
+
+                                        # IMPORTANT: Return empty string to pause execution and wait for user input
+                                    # Do NOT continue the loop - let the user decide whether to proceed
+                                    logger.info("[Agent] Step 1 execution complete, returning control to user")
                                     
-                                    # Now pause and wait for frontend response
-                                    logger.info("[Agent] Pausing execution, waiting for frontend to send step analysis result")
+
                                     
                                     # Add messages to history
                                     msg_dump = message.model_dump()
@@ -1634,6 +1673,96 @@ Don't repeat this if `bot_name` already exists in memory.
                 logger.error(f"Critical error in Agent.chat_stream(): {exc}")
                 logger.error(f"Traceback:\n{error_details}")
                 return f"Error: {exc}"
+            
+    def _extract_device_info_from_context(self) -> dict:
+                """Extract device information from conversation context."""
+                import re
+                
+                # Default device info
+                device_info = {
+                    "ip": "",
+                    "port": 23,
+                    "protocol": "telnet",
+                    "username": "",
+                    "password": ""
+                }
+                
+                # Get all user messages from conversation history
+                user_messages = []
+                for msg in self.messages:
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if content:
+                            user_messages.append(content)
+                
+                # Combine all user messages for analysis
+                combined_text = "\n".join(user_messages)
+                
+                if not combined_text:
+                    logger.warning("[DeviceInfo] No user messages found in context")
+                    return device_info
+                
+                # Extract IP address patterns
+                ip_patterns = [
+                    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+                    r'IP[:\s]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+                    r'设备[:\s]*IP[:\s]*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+                ]
+                
+                for pattern in ip_patterns:
+                    match = re.search(pattern, combined_text)
+                    if match:
+                        device_info["ip"] = match.group(1)
+                        logger.info(f"[DeviceInfo] Extracted IP: {device_info['ip']}")
+                        break
+                
+                # Extract username patterns
+                username_patterns = [
+                    r'(?:用户名|username|user)[:\s]*([a-zA-Z0-9_@.-]+)',
+                    r'([a-zA-Z0-9_@.-]+@[a-zA-Z0-9_.-]+)',
+                ]
+                
+                for pattern in username_patterns:
+                    match = re.search(pattern, combined_text, re.IGNORECASE)
+                    if match:
+                        candidate = match.group(1)
+                        if candidate.lower() not in ['display', 'ping', 'show', 'check']:
+                            device_info["username"] = candidate
+                            logger.info(f"[DeviceInfo] Extracted username: {device_info['username']}")
+                            break
+                
+                # Extract password patterns
+                password_patterns = [
+                    r'(?:密码|password|passwd)[:\s]*([^\s,，;；]+)',
+                ]
+                
+                for pattern in password_patterns:
+                    match = re.search(pattern, combined_text, re.IGNORECASE)
+                    if match:
+                        device_info["password"] = match.group(1)
+                        logger.info(f"[DeviceInfo] Extracted password: {'*' * len(device_info['password'])}")
+                        break
+                
+                # Extract port if specified
+                port_match = re.search(r'(?:端口|port)[:\s]*(\d+)', combined_text, re.IGNORECASE)
+                if port_match:
+                    try:
+                        device_info["port"] = int(port_match.group(1))
+                        logger.info(f"[DeviceInfo] Extracted port: {device_info['port']}")
+                    except ValueError:
+                        pass
+                
+                # Extract protocol if specified
+                protocol_match = re.search(r'(?:协议|protocol)[:\s]*(telnet|ssh|http|https)', combined_text, re.IGNORECASE)
+                if protocol_match:
+                    device_info["protocol"] = protocol_match.group(1).lower()
+                    logger.info(f"[DeviceInfo] Extracted protocol: {device_info['protocol']}")
+                
+                # If IP is still empty, log warning
+                if not device_info["ip"]:
+                    logger.warning("[DeviceInfo] Could not extract IP address from context")
+                
+                return device_info
 
         # This should never be reached
-        return ""
+        # return ""

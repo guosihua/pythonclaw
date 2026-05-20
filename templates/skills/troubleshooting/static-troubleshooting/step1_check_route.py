@@ -1,14 +1,20 @@
 """
 Step 1: Check if static route exists in global routing table
 
-This script encapsulates the device command to check the routing table
-and returns data in the format required by the frontend.
+This script calls the terminal API to execute device commands and analyzes
+the routing table response to determine if the static route exists.
 """
 
 import json
 import sys
+import requests
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+
+
+# Terminal API Configuration
+TERMINAL_API_BASE_URL = "http://10.153.61.64/terminal/api/terminal/ai"
+DEVICE_INFO_ENDPOINT = f"{TERMINAL_API_BASE_URL}/deviceInfo"
 
 
 def load_devices_config(devices_file_path: str = None) -> list:
@@ -71,6 +77,96 @@ def get_device_by_ip(devices: list, ip_address: str) -> Optional[Dict[str, Any]]
             }
     
     return None
+
+
+def execute_device_command(
+    command: str,
+    device_info: Dict[str, Any],
+    session_id: str
+) -> Dict[str, Any]:
+    """
+    Execute a command on a remote device via Terminal API.
+    
+    Args:
+        command: The command to execute (e.g., "display ip routing-table 0.0.0.0/0")
+        device_info: Device connection information
+        session_id: Session identifier for the API call
+    
+    Returns:
+        API response containing command output
+    
+    Raises:
+        requests.exceptions.RequestException: If API call fails
+    """
+    # Build request payload
+    payload = [{
+        "command": [command],
+        "device": {
+            "ip": device_info.get("ip", ""),
+            "password": device_info.get("password", ""),
+            "port": device_info.get("port", 23),
+            "protocol": device_info.get("protocol", "telnet"),
+            "username": device_info.get("username", "")
+        },
+        "sessionId": session_id
+    }]
+    
+    # Make API request
+    try:
+        response = requests.post(
+            DEVICE_INFO_ENDPOINT,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Check if API returned success
+        if result.get("code") != 0:
+            raise Exception(f"API error: {result.get('message', 'Unknown error')}")
+        
+        return result
+        
+    except requests.exceptions.Timeout:
+        raise Exception("Device command execution timed out (30s)")
+    except requests.exceptions.ConnectionError:
+        raise Exception(f"Failed to connect to Terminal API at {DEVICE_INFO_ENDPOINT}")
+    except Exception as e:
+        raise Exception(f"Device command execution failed: {str(e)}")
+
+
+def extract_command_output(api_response: Dict[str, Any]) -> str:
+    """
+    Extract the actual command output from API response.
+    
+    Args:
+        api_response: Raw API response
+    
+    Returns:
+        Extracted command output string
+    """
+    try:
+        data = api_response.get("data", [])
+        if not data:
+            return ""
+        
+        # Get echo from first result
+        first_result = data[0]
+        echo = first_result.get("echo", {})
+        
+        # Echo is a dict mapping command to output
+        # Example: {"display ip routing-table 0.0.0.0/0": "actual output..."}
+        if echo:
+            # Return the first (and usually only) value
+            return list(echo.values())[0]
+        
+        return ""
+        
+    except Exception as e:
+        print(f"# Warning: Failed to extract command output: {e}", file=sys.stderr)
+        return ""
 
 
 def build_step_command(
@@ -250,10 +346,46 @@ def main():
             print(json.dumps({"error": "Missing response data for analyze mode"}))
             sys.exit(1)
         
-        response_data = sys.argv[2]
-        analysis_result = analyze_route_result(response_data)
-        
-        print(json.dumps(analysis_result, ensure_ascii=False))
+        # Parse the API response
+        try:
+            api_response = json.loads(sys.argv[2])
+            
+            # Extract command output from API response
+            command_output = extract_command_output(api_response)
+            
+            if not command_output:
+                print(json.dumps({
+                    "step": 1,
+                    "step_name": "检查全局路由表中是否存在该静态路由",
+                    "status": "error",
+                    "route_exists": False,
+                    "next_step": "retry",
+                    "message": "无法从API响应中提取命令输出"
+                }, ensure_ascii=False))
+                sys.exit(0)
+            
+            # Analyze the extracted output
+            analysis_result = analyze_route_result(command_output)
+            print(json.dumps(analysis_result, ensure_ascii=False))
+            
+        except json.JSONDecodeError as e:
+            print(json.dumps({
+                "step": 1,
+                "step_name": "检查全局路由表中是否存在该静态路由",
+                "status": "error",
+                "route_exists": False,
+                "next_step": "retry",
+                "message": f"API响应JSON解析失败: {str(e)}"
+            }, ensure_ascii=False))
+        except Exception as e:
+            print(json.dumps({
+                "step": 1,
+                "step_name": "检查全局路由表中是否存在该静态路由",
+                "status": "error",
+                "route_exists": False,
+                "next_step": "retry",
+                "message": f"分析过程出错: {str(e)}"
+            }, ensure_ascii=False))
     
     else:
         print(json.dumps({"error": f"Unknown mode: {mode}"}))
