@@ -152,11 +152,15 @@ class SkillRegistry:
         skills: list[SkillMetadata] = []
         seen_names: set[str] = set()
 
+        logger.info("[SkillRegistry] Starting discovery with %d directories", len(self.skills_dirs))
         for s_dir in self.skills_dirs:
             if not os.path.isdir(s_dir):
+                logger.warning("[SkillRegistry] Directory not found: %s", s_dir)
                 continue
+            logger.info("[SkillRegistry] Scanning directory: %s", s_dir)
             self._scan_dir(s_dir, skills, seen_names)
-
+        
+        logger.info("[SkillRegistry] Discovery complete. Found %d skills: %s", len(skills), [s.name for s in skills])
         self._cache = skills
         return skills
 
@@ -165,8 +169,23 @@ class SkillRegistry:
         base_dir: str,
         out: list[SkillMetadata],
         seen: set[str],
+        category: str = "",
+        depth: int = 0,
     ) -> None:
-        """Recursively find SKILL.md files up to 2 levels deep."""
+        """Recursively find SKILL.md files with support for deep directory structures.
+        
+        Supports:
+        - Flat layout: skills/<skill>/SKILL.md
+        - Categorised layout: skills/<category>/<skill>/SKILL.md
+        - Deep categorised layout: skills/<category>/<subcategory>/<skill>/SKILL.md
+        """
+        # Limit recursion depth to avoid infinite loops (max 4 levels)
+        if depth > 4:
+            logger.debug("[SkillRegistry] Max depth reached at %s", base_dir)
+            return
+        
+        logger.debug("[SkillRegistry] Scanning dir (depth=%d, category=%s): %s", depth, category, base_dir)
+            
         for entry in sorted(os.listdir(base_dir)):
             if entry.startswith(("__", ".")):
                 continue
@@ -176,32 +195,29 @@ class SkillRegistry:
 
             skill_md = os.path.join(entry_path, "SKILL.md")
             if os.path.isfile(skill_md):
-                # Flat layout: skills/<skill>/SKILL.md
-                meta = self._read_metadata(skill_md, entry_path, category="")
+                # Found a skill at this level
+                logger.info("[SkillRegistry] Found skill: %s at %s", entry, entry_path)
+                meta = self._read_metadata(skill_md, entry_path, category=category)
                 if meta and meta.name not in seen:
                     out.append(meta)
                     seen.add(meta.name)
+                    logger.info("[SkillRegistry] Registered skill: %s (category=%s)", meta.name, category)
             else:
-                # Categorised layout: skills/<category>/<skill>/SKILL.md
-                category_name = entry
+                # Check if this is a category directory
+                new_category = category
                 cat_md = os.path.join(entry_path, "CATEGORY.md")
-                if os.path.isfile(cat_md) and category_name not in self._categories:
-                    cat_meta = self._read_category(cat_md, category_name)
-                    if cat_meta:
-                        self._categories[category_name] = cat_meta
-
-                for sub_entry in sorted(os.listdir(entry_path)):
-                    if sub_entry.startswith(("__", ".")):
-                        continue
-                    sub_path = os.path.join(entry_path, sub_entry)
-                    sub_md = os.path.join(sub_path, "SKILL.md")
-                    if os.path.isdir(sub_path) and os.path.isfile(sub_md):
-                        meta = self._read_metadata(
-                            sub_md, sub_path, category=category_name
-                        )
-                        if meta and meta.name not in seen:
-                            out.append(meta)
-                            seen.add(meta.name)
+                if os.path.isfile(cat_md):
+                    # This is a category directory
+                    category_name = entry
+                    if category_name not in self._categories:
+                        cat_meta = self._read_category(cat_md, category_name)
+                        if cat_meta:
+                            self._categories[category_name] = cat_meta
+                            logger.info("[SkillRegistry] Found category: %s", category_name)
+                    new_category = category_name
+                
+                # Recursively scan subdirectories
+                self._scan_dir(entry_path, out, seen, category=new_category, depth=depth + 1)
 
     @staticmethod
     def _read_category(cat_path: str, fallback_name: str) -> CategoryMetadata | None:

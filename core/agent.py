@@ -635,6 +635,68 @@ Don't repeat this if `bot_name` already exists in memory.
 
         return str(result)
 
+    # ── Tool call parsing fallbacks ────────────────────────────────────────────
+
+    def _create_forced_tool_call(self):
+        """Create a forced tool call when LLM fails to call tools despite strong prompts.
+        
+        This is used when:
+        1. Troubleshooting intent is detected
+        2. LLM returns empty content or no tool calls
+        3. We need to force skill activation
+        
+        Returns MockToolCall object or None if no appropriate skill found.
+        """
+        from .llm.response import MockFunction, MockToolCall
+        
+        try:
+            # Get the last user message to determine intent
+            last_user_msg = ""
+            for msg in reversed(self.messages):
+                if msg.get("role") == "user":
+                    last_user_msg = msg.get("content", "")
+                    break
+            
+            # Detect troubleshooting intent
+            troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由']
+            has_troubleshooting_intent = any(kw in last_user_msg.lower() for kw in troubleshooting_keywords)
+            
+            if has_troubleshooting_intent:
+                skills = self._registry.discover()
+                
+                # Extract skill names from SkillMetadata objects
+                skill_names = [s.name for s in skills]
+                
+                # Prefer static-troubleshooting for static route issues
+                if 'static-troubleshooting' in skill_names:
+                    skill_name = 'static-troubleshooting'
+                elif 'CT-AP-not-online-zhuwang' in skill_names:
+                    skill_name = 'CT-AP-not-online-zhuwang'
+                else:
+                    # Find any troubleshooting skill by checking name field
+                    troubleshooting_skills = [s.name for s in skills if 'troubleshoot' in s.name.lower()]
+                    if troubleshooting_skills:
+                        skill_name = troubleshooting_skills[0]
+                    else:
+                        logger.warning("[Agent] No troubleshooting skills available")
+                        return None
+                
+                logger.info(f"[Agent] Force-activating skill: {skill_name}")
+                arguments_json = json.dumps({"skill_name": skill_name})
+                
+                return MockToolCall(
+                    id=f"call_forced_{int(time.time())}",
+                    function=MockFunction(name="use_skill", arguments=arguments_json),
+                    type="function"
+                )
+            
+        except Exception as e:
+            logger.warning(f"[Agent] Failed to create forced tool call: {e}")
+            import traceback
+            logger.debug(f"[Agent] Forced tool call error: {traceback.format_exc()}")
+        
+        return None
+
     # ── Skill registry refresh (after create_skill) ────────────────────────
 
     def _refresh_skill_registry(self) -> None:
@@ -1227,10 +1289,155 @@ Don't repeat this if `bot_name` already exists in memory.
                     return ""
 
                 message = response.choices[0].message
-                # Log the full message content for debugging step markers
-                logger.info("[Agent] LLM response content: %s", repr((message.content or "")[:500]))
-                logger.info("[Agent] LLM has tool_calls: %s", bool(message.tool_calls))
+                
+                # Log detailed response information for debugging
+                logger.info("[Agent] === LLM Response Details ===")
+                logger.info("[Agent] Content (first 500 chars): %s", repr((message.content or "")[:500]))
+                logger.info("[Agent] Content length: %d chars", len(message.content or ""))
+                logger.info("[Agent] Has tool_calls: %s", bool(message.tool_calls))
+                if message.tool_calls:
+                    logger.info("[Agent] Tool calls count: %d", len(message.tool_calls))
+                    for i, tc in enumerate(message.tool_calls):
+                        logger.info("[Agent]   Tool call %d: name=%s, args=%s", 
+                                  i, tc.function.name, tc.function.arguments[:200])
+                else:
+                    logger.info("[Agent] Tool calls: None/Empty")
+                
+                # Log the full message object structure for debugging
+                msg_dict = message.model_dump()
+                logger.debug("[Agent] Full message keys: %s", list(msg_dict.keys()))
+                logger.debug("[Agent] Message dict: %s", json.dumps(msg_dict, ensure_ascii=False, default=str)[:1000])
+                
                 print(message)
+
+                # Fallback: If troubleshooting intent detected but no tool calls, force create tool call
+                if suppress_conversational_text and not message.tool_calls:
+                    logger.warning("[Agent] Troubleshooting intent detected but LLM did not call any tool")
+                    logger.info("[Agent] Content preview: %s", repr((message.content or "")[:200]))
+                    
+                    # Force create use_skill tool call based on intent
+                    forced_tool_call = self._create_forced_tool_call()
+                    if forced_tool_call:
+                        logger.info(f"[Agent] Force-created tool call: {forced_tool_call.function.name}")
+                        logger.info(f"[Agent] Tool arguments: {forced_tool_call.function.arguments}")
+                        
+                        # IMPORTANT: Directly execute the forced tool call without going through another LLM round
+                        # This avoids infinite loop since H3C AI doesn't support native function calling
+                        logger.info("[Agent] Executing forced tool call directly...")
+                        
+                        # Execute the tool call
+                        try:
+                            result = self._execute_tool_call(forced_tool_call)
+                            logger.info(f"[Agent] Forced tool execution result (first 200 chars): {result[:200]}")
+                            
+                            # Check if skill was successfully activated
+                            if "activated" in result.lower() or "already active" in result.lower():
+                                # Skill is now active, extract steps and start execution
+                                logger.info("[Agent] Skill activated, starting step execution...")
+                                
+                                # Extract steps from the activated skill
+                                if hasattr(self, '_current_skill_steps') and self._current_skill_steps:
+                                    logger.info(f"[Agent] Found {len(self._current_skill_steps)} steps to execute")
+                                    
+                                    # IMPORTANT: Don't continue the loop (which would call LLM again)
+                                    # Instead, directly execute the first step script
+                                    first_step_name = self._current_skill_steps[0]
+                                    logger.info(f"[Agent] Executing first step: {first_step_name}")
+                                    
+                                    # Create a mock tool call for execute_step_script
+                                    from .llm.response import MockFunction, MockToolCall
+                                    
+                                    # Extract skill name from forced_tool_call arguments
+                                    skill_args = json.loads(forced_tool_call.function.arguments) if isinstance(forced_tool_call.function.arguments, str) else forced_tool_call.function.arguments
+                                    skill_name = skill_args.get("skill_name", "static-troubleshooting")
+                                    
+                                    # Build parameters for the step script
+                                    # execute_step_script expects: script_name, mode, params
+                                    step_params = {
+                                        "step_name": first_step_name,
+                                        "step_number": 1,
+                                        "skill_name": skill_name
+                                    }
+                                    
+                                    # Arguments must match execute_step_script signature: (script_name, mode, params)
+                                    step_args_json = json.dumps({
+                                        "script_name": "step1_check_route.py",
+                                        "mode": "build",
+                                        "params": step_params
+                                    })
+                                    
+                                    step_tool_call = MockToolCall(
+                                        id=f"call_step_1_{int(time.time())}",
+                                        function=MockFunction(name="execute_step_script", arguments=step_args_json),
+                                        type="function"
+                                    )
+
+                                    # Execute the step script
+                                    step_result = self._execute_tool_call(step_tool_call)
+                                    logger.info(f"[Agent] Step execution result (first 200 chars): {step_result[:200]}")
+                                    
+                                    # Send step notification and command to frontend
+                                    if on_token:
+                                        # Send stepName
+                                        step_marker = f"[STEP_START]{first_step_name}[STEP_END]"
+                                        logger.info(f"[SkillSteps] Sending proactive step notification for step 1: {first_step_name}")
+                                        on_token(step_marker)
+                                        
+                                        # Send stepCommand if present in result
+                                        try:
+                                            import json as _json
+                                            if isinstance(step_result, str):
+                                                parsed = _json.loads(step_result)
+                                                if parsed.get("answerType") == "stepCommand":
+                                                    logger.info("[Agent] Sending stepCommand to frontend")
+                                                    on_token(step_result)
+                                        except Exception as e:
+                                            logger.warning(f"[Agent] Failed to parse step result: {e}")
+                                    
+                                    # Now pause and wait for frontend response
+                                    logger.info("[Agent] Pausing execution, waiting for frontend to send step analysis result")
+                                    
+                                    # Add messages to history
+                                    msg_dump = message.model_dump()
+                                    if msg_dump.get("content") is None:
+                                        msg_dump["content"] = ""
+                                    self.messages.append(msg_dump)
+                                    
+                                    self.messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": forced_tool_call.id,
+                                        "name": forced_tool_call.function.name,
+                                        "content": result,
+                                    })
+                                    
+                                    # Return empty string to indicate we're waiting for user input
+                                    return ""
+                                else:
+                                    logger.warning("[Agent] No steps extracted from skill")
+                                    # Fall through to normal processing
+                            else:
+                                # Skill activation failed, add tool call and result to history
+                                msg_dump = message.model_dump()
+                                if msg_dump.get("content") is None:
+                                    msg_dump["content"] = ""
+                                self.messages.append(msg_dump)
+                                
+                                self.messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": forced_tool_call.id,
+                                    "name": forced_tool_call.function.name,
+                                    "content": result,
+                                })
+                                
+                                # Continue to next iteration
+                                continue
+                        except Exception as e:
+                            logger.error(f"[Agent] Failed to execute forced tool call: {e}")
+                            import traceback
+                            logger.error(f"[Agent] Traceback: {traceback.format_exc()}")
+                            # Fall through to normal processing if execution fails
+                    else:
+                        logger.warning("[Agent] Failed to create forced tool call")
 
                 # Suppress ALL text content when there are tool calls
                 # This prevents conversational text from being sent to frontend during skill execution

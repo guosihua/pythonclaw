@@ -1,6 +1,6 @@
 ---
 name: static-troubleshooting
-description: 用于排查网络设备静态路由故障的标准流程，包含路由存在性、下一跳可达性、接口状态及优先级检查
+description: 静态路由故障排查，用于排查网络设备静态路由故障的标准流程，包含路由存在性、下一跳可达性、接口状态及优先级检查
 trigger:
   type: keyword
   keywords:

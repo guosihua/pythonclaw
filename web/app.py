@@ -1181,8 +1181,11 @@ async def _sse_chat(request: Request):
 
         def _on_token(text: str) -> None:
             # Process step markers and send appropriate messages
+            logger.info("[SSE] _on_token called with text length: %d, preview: %s", len(text), repr(text[:100]))
             messages = process_step_markers(sessionId, text, context_id, question_no, step_counter)
-            for msg in messages:
+            logger.info("[SSE] process_step_markers returned %d messages", len(messages))
+            for i, msg in enumerate(messages):
+                logger.info("[SSE] Sending message %d: %s", i+1, repr(msg[:150]))
                 loop.call_soon_threadsafe(sse_queue.put_nowait, msg)
 
         chat_input: str | list = message or ""
@@ -1200,17 +1203,24 @@ async def _sse_chat(request: Request):
         chat_task = asyncio.create_task(_run_chat())
 
         try:
+            message_count = 0
             while True:
                 sse_chunk = await sse_queue.get()
                 if sse_chunk is None:
+                    logger.info("[SSE] Received None from queue, breaking loop after %d messages", message_count)
                     break
+                message_count += 1
+                logger.info("[SSE] Yielding message %d to client: %s", message_count, repr(sse_chunk[:150]))
                 yield sse_chunk
+            logger.info("[SSE] Total messages sent: %d", message_count)
         except Exception as exc:
             logger.exception("[Web] SSE chat error: %s", str(exc))
             if not chat_task.done():
                 chat_task.cancel()
         finally:
-            yield build_response(sessionId, '', True)
+            final_msg = build_response(sessionId, '', True)
+            logger.info("[SSE] Sending final empty response: %s", repr(final_msg))
+            yield final_msg
     
     return StreamingResponse(
         generate_sse(),

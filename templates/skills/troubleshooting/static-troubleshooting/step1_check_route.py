@@ -7,7 +7,70 @@ and returns data in the format required by the frontend.
 
 import json
 import sys
-from typing import Dict, Any
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+
+def load_devices_config(devices_file_path: str = None) -> list:
+    """
+    Load device configuration from devices.json file.
+    
+    Args:
+        devices_file_path: Path to devices.json file. If None, uses default path.
+    
+    Returns:
+        List of device configurations
+    
+    Example:
+        >>> devices = load_devices_config()
+        >>> device = get_device_by_ip(devices, "10.88.142.204")
+    """
+    if devices_file_path is None:
+        # Default path: project_root/file/devices.json
+        project_root = Path(__file__).parent.parent.parent.parent.parent
+        devices_file_path = project_root / "file" / "devices.json"
+    
+    devices_path = Path(devices_file_path)
+    
+    if not devices_path.exists():
+        raise FileNotFoundError(f"Devices config file not found: {devices_path}")
+    
+    with open(devices_path, 'r', encoding='utf-8') as f:
+        devices = json.load(f)
+    
+    return devices
+
+
+def get_device_by_ip(devices: list, ip_address: str) -> Optional[Dict[str, Any]]:
+    """
+    Get device information by IP address.
+    
+    Args:
+        devices: List of device configurations (from load_devices_config)
+        ip_address: IP address to search for
+    
+    Returns:
+        Device configuration dict or None if not found
+    
+    Example:
+        >>> devices = load_devices_config()
+        >>> device = get_device_by_ip(devices, "10.88.142.204")
+        >>> if device:
+        ...     print(f"Found device: {device['userName']}@{device['ip']}")
+    """
+    for device in devices:
+        if device.get("ip") == ip_address:
+            # Convert devices.json format to the format expected by build_step_command
+            return {
+                "ip": device.get("ip", ""),
+                "username": device.get("userName", ""),
+                "password": device.get("password", ""),
+                "port": device.get("port", 23),
+                "protocol": device.get("protocol", "telnet"),
+                "uuid": device.get("deviceId", "")
+            }
+    
+    return None
 
 
 def build_step_command(
@@ -119,6 +182,11 @@ def main():
     Expected input via stdin or command line arguments:
     - Mode: "build" (build command) or "analyze" (analyze response)
     - Parameters as JSON
+    
+    For build mode, device_info can be:
+    - Full device info dict (backward compatible)
+    - Just IP address string (will load from devices.json)
+    - Dict with only "ip" field (will merge with devices.json data)
     """
     if len(sys.argv) < 2:
         print(json.dumps({"error": "Usage: python step1_check_route.py <mode> [params]"}))
@@ -134,9 +202,40 @@ def main():
         
         params = json.loads(sys.argv[2])
         
+        # Load device information
+        device_info = params.get("device_info", {})
+        
+        # If device_info is just an IP string, convert to dict
+        if isinstance(device_info, str):
+            device_info = {"ip": device_info}
+        
+        # If device_info only has IP, try to load full info from devices.json
+        if device_info and "ip" in device_info:
+            ip_address = device_info["ip"]
+            
+            # Check if we have complete device info or need to load from config
+            needs_full_info = not all(k in device_info for k in ["username", "password", "port", "protocol"])
+            
+            if needs_full_info:
+                try:
+                    devices = load_devices_config()
+                    full_device_info = get_device_by_ip(devices, ip_address)
+                    
+                    if full_device_info:
+                        # Merge provided info with loaded info (provided takes precedence)
+                        device_info = {**full_device_info, **device_info}
+                        print(f"# Loaded device info for {ip_address} from devices.json", file=sys.stderr)
+                    else:
+                        print(f"# Warning: Device {ip_address} not found in devices.json, using provided info only", file=sys.stderr)
+                        
+                except FileNotFoundError as e:
+                    print(f"# Warning: {e}, using provided device info only", file=sys.stderr)
+                except Exception as e:
+                    print(f"# Warning: Failed to load devices.json: {e}, using provided device info only", file=sys.stderr)
+        
         step_command = build_step_command(
             destination_network=params.get("destination_network", ""),
-            device_info=params.get("device_info", {}),
+            device_info=device_info,
             context_id=params.get("context_id", ""),
             question_no=params.get("question_no", ""),
             session_id=params.get("session_id", ""),
