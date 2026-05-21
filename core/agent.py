@@ -304,6 +304,9 @@ class Agent:
 
         self.loaded_skill_names: set[str] = set()
         self.pending_injections: list[str] = []
+        self._session_step_indices: dict[str, int] = {}  # Track step progress per session
+        self._current_skill_steps: list[str] = []  # Store current skill's steps
+        self._current_skill_step_numbers: list[int] = []  # Store actual step numbers from SKILL.md
         self.MAX_PARALLEL_SKILLS = config.get_int(
             "agent", "maxParallelSkills", default=5,
         )
@@ -643,13 +646,86 @@ Don't repeat this if `bot_name` already exists in memory.
         This is used when:
         1. Troubleshooting intent is detected
         2. LLM returns empty content or no tool calls
-        3. We need to force skill activation
+        3. We need to force skill activation or continue pending steps
         
         Returns MockToolCall object or None if no appropriate skill found.
         """
         from .llm.response import MockFunction, MockToolCall
         
         try:
+            # Check if a troubleshooting skill is already active with pending steps
+            if hasattr(self, '_current_skill_steps') and self._current_skill_steps:
+                logger.info(f"[Agent] Skill already active with {len(self._current_skill_steps)} pending steps")
+                logger.info(f"[Agent] Pending steps: {self._current_skill_steps}")
+                
+                # Skill is already active, we need to continue execution
+                # Check if user provided supplementary information
+                last_user_msg = ""
+                for msg in reversed(self.messages):
+                    if msg.get("role") == "user":
+                        last_user_msg = msg.get("content", "")
+                        break
+                
+                # Extract device info and destination from user message
+                import re
+                ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
+                has_ip = bool(re.search(ip_pattern, last_user_msg))
+                
+                # If user provided IP info, create step execution instead of skill activation
+                if has_ip:
+                    logger.info(f"[Agent] User provided supplementary info, creating step execution")
+                    # Create execute_step_script call to continue with the steps
+                    skill_name = 'static-troubleshooting'  # Default to static-troubleshooting
+                    analysis_type = 'check_route'  # Default analysis type
+                    
+                    # Extract destination network from user message
+                    destination_network = "0.0.0.0/0"
+                    dest_keyword_match = re.search(r'(目的网段|目标网段|目的IP)\s*[：:]?\s*([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)', last_user_msg)
+                    if dest_keyword_match:
+                        destination_network = dest_keyword_match.group(2)
+                        logger.info(f"[Agent] Extracted destination_network: {destination_network}")
+                    else:
+                        ip_matches = re.findall(ip_pattern, last_user_msg)
+                        if ip_matches:
+                            destination_network = ip_matches[-1]
+                            logger.info(f"[Agent] Using last IP as destination: {destination_network}")
+                    
+                    # Extract device info
+                    device_info = self._extract_device_info_from_context()
+                    logger.info(f"[Agent] Extracted device info: {device_info}")
+                    
+                    # Get current step using session_id to track progress
+                    session_id_for_step = self.session_id or "default"
+                    current_step = self._session_step_indices.get(session_id_for_step, 0)
+                    first_step_name = self._current_skill_steps[current_step] if current_step < len(self._current_skill_steps) else self._current_skill_steps[0]
+                    logger.info(f"[Agent] Session: {session_id_for_step}, Current step: {current_step}, step name: {first_step_name}")
+                    
+                    # Create execute_step_script arguments
+                    step_params = {
+                        "step_name": first_step_name,
+                        "step_number": current_step + 1,
+                        "skill_name": skill_name,
+                        "analysis_type": analysis_type,
+                        "destination_network": destination_network,
+                        "device_info": device_info,
+                        "context_id": "",
+                        "question_no": "",
+                        "session_id": session_id_for_step
+                    }
+                    
+                    step_args_json = json.dumps({
+                        "script_name": "step_executor.py",
+                        "mode": "build_and_execute",
+                        "params": step_params
+                    })
+                    
+                    logger.info(f"[Agent] Creating execute_step_script tool call for pending step")
+                    return MockToolCall(
+                        id=f"call_step_pending_{int(time.time())}",
+                        function=MockFunction(name="execute_step_script", arguments=step_args_json),
+                        type="function"
+                    )
+            
             # Get the last user message to determine intent
             last_user_msg = ""
             for msg in reversed(self.messages):
@@ -661,22 +737,41 @@ Don't repeat this if `bot_name` already exists in memory.
             troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由']
             has_troubleshooting_intent = any(kw in last_user_msg.lower() for kw in troubleshooting_keywords)
             
+            # Also detect IP address patterns which might indicate routing troubleshooting
+            import re
+            ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
+            has_ip_address = bool(re.search(ip_pattern, last_user_msg))
+            
+            # If either troubleshooting keywords or IP address found, consider it troubleshooting intent
+            has_troubleshooting_intent = has_troubleshooting_intent or has_ip_address
+            
+            logger.info(f"[Agent] Intent detection - last_user_msg: {last_user_msg[:100]}")
+            logger.info(f"[Agent] Intent detection - has_troubleshooting_keywords: {any(kw in last_user_msg.lower() for kw in troubleshooting_keywords)}")
+            logger.info(f"[Agent] Intent detection - has_ip_address: {has_ip_address}")
+            logger.info(f"[Agent] Intent detection - has_troubleshooting_intent: {has_troubleshooting_intent}")
+            
             if has_troubleshooting_intent:
                 skills = self._registry.discover()
+                logger.info(f"[Agent] Found {len(skills)} skills in registry")
                 
                 # Extract skill names from SkillMetadata objects
                 skill_names = [s.name for s in skills]
+                logger.info(f"[Agent] Available skill names: {skill_names}")
                 
                 # Prefer static-troubleshooting for static route issues
                 if 'static-troubleshooting' in skill_names:
                     skill_name = 'static-troubleshooting'
+                    logger.info(f"[Agent] Selected skill: {skill_name}")
                 elif 'CT-AP-not-online-zhuwang' in skill_names:
                     skill_name = 'CT-AP-not-online-zhuwang'
+                    logger.info(f"[Agent] Selected skill: {skill_name}")
                 else:
                     # Find any troubleshooting skill by checking name field
                     troubleshooting_skills = [s.name for s in skills if 'troubleshoot' in s.name.lower()]
+                    logger.info(f"[Agent] Troubleshooting skills found: {troubleshooting_skills}")
                     if troubleshooting_skills:
                         skill_name = troubleshooting_skills[0]
+                        logger.info(f"[Agent] Selected troubleshooting skill: {skill_name}")
                     else:
                         logger.warning("[Agent] No troubleshooting skills available")
                         return None
@@ -819,12 +914,38 @@ Don't repeat this if `bot_name` already exists in memory.
         import re
         step_pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
         steps = re.findall(step_pattern, skill.instructions)
-        if steps:
-            # Store extracted steps for later use in chat_stream
+        
+        # Extract step numbers from skill instructions to match SKILL.md definitions
+        # Pattern to match "第X步：" or "Step X:" format
+        step_number_pattern = r'第(\d+)步：|Step\s+(\d+):'
+        step_number_matches = list(re.finditer(step_number_pattern, skill.instructions))
+        
+        if steps and step_number_matches:
+            # Map step names to their actual step numbers from SKILL.md
+            step_name_to_number = {}
+            for match in step_number_matches:
+                step_num = int(match.group(1) or match.group(2))
+                # Find the step name after this marker
+                after_marker = skill.instructions[match.end():]
+                # Look for the next STEP_START marker
+                next_step_match = re.search(r'\[STEP_START\](.*?)\[STEP_END\]', after_marker)
+                if next_step_match:
+                    step_name = next_step_match.group(1).strip()
+                    step_name_to_number[step_name] = step_num
+            
+            # Store steps with their actual numbers
             self._current_skill_steps = steps
+            self._current_skill_step_numbers = [step_name_to_number.get(step, idx + 1) for idx, step in enumerate(steps)]
+            logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
+            logger.info("[SkillSteps] Step numbers: %s", self._current_skill_step_numbers[:3])
+        elif steps:
+            # Fallback: use sequential numbering if no step numbers found
+            self._current_skill_steps = steps
+            self._current_skill_step_numbers = list(range(1, len(steps) + 1))
             logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
         else:
             self._current_skill_steps = []
+            self._current_skill_step_numbers = []
         
         if self.verbose:
             logger.debug("Skill activated: %s (Level 2 loaded)", skill_name)
@@ -1219,8 +1340,18 @@ Don't repeat this if `bot_name` already exists in memory.
             user_input_lower = user_input.lower()
         
         troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由', '不通', 'not working']
-        if any(kw in user_input_lower for kw in troubleshooting_keywords):
-            logger.info("[Agent] Detected troubleshooting intent, enabling text suppression")
+        has_troubleshooting_keywords = any(kw in user_input_lower for kw in troubleshooting_keywords)
+        
+        # Also detect IP address patterns which might indicate routing troubleshooting
+        import re
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
+        has_ip_address = bool(re.search(ip_pattern, user_input)) if isinstance(user_input, str) else False
+        
+        # If either troubleshooting keywords or IP address found, consider it troubleshooting intent
+        if has_troubleshooting_keywords or has_ip_address:
+            logger.info(f"[Agent] Detected troubleshooting intent, enabling text suppression")
+            logger.info(f"[Agent]   has_troubleshooting_keywords: {has_troubleshooting_keywords}")
+            logger.info(f"[Agent]   has_ip_address: {has_ip_address}")
             suppress_conversational_text = True
         
         # Note: Initial step notification is handled proactively before tool execution
@@ -1328,16 +1459,51 @@ Don't repeat this if `bot_name` already exists in memory.
                         # Execute the tool call
                         try:
                             result = self._execute_tool_call(forced_tool_call)
-                            logger.info(f"[Agent] Forced tool execution result (first 200 chars): {result[:200]}")
+                            
+                            # Log forced tool execution result with proper handling
+                            try:
+                                if result is None:
+                                    logger.info("[Agent] Forced tool execution result: None")
+                                else:
+                                    result_str = str(result)
+                                    logger.info(f"[Agent] Forced tool execution result type: {type(result).__name__}")
+                                    logger.info(f"[Agent] Forced tool execution result length: {len(result_str)} chars")
+                                    logger.info(f"[Agent] Forced tool execution result:\n{result_str}")
+                            except Exception as e:
+                                logger.warning(f"[Agent] Failed to log forced tool result: {e}")
                             
                             # Check if skill was successfully activated
-                            if "activated" in result.lower() or "already active" in result.lower():
-                                # Skill is now active, extract steps and start execution
-                                logger.info("[Agent] Skill activated, starting step execution...")
+                            result_lower = str(result).lower() if result else ""
+                            skill_activated = "activated" in result_lower or "already active" in result_lower
+                            
+                            # Also check if result is a step execution result (stepContent, stepAnalysis, etc.)
+                            parsed_result = None
+                            step_result_type = None
+                            try:
+                                import json as _json
+                                if isinstance(result, str):
+                                    parsed_result = _json.loads(result)
+                                    step_result_type = parsed_result.get("answerType") if parsed_result else None
+                            except:
+                                pass
+                            
+                            logger.info(f"[Agent] Skill activation check: skill_activated={skill_activated}, step_result_type={step_result_type}")
+                            
+                            # Check if this is a step execution result (not skill activation)
+                            is_step_result = step_result_type in ("stepContent", "stepAnalysis", "stepCommand", "stepInfoRequest", "stepError")
+                            
+                            if skill_activated or is_step_result:
+                                # Skill is now active or we have step execution result, extract steps and start/execute steps
+                                if skill_activated:
+                                    logger.info("[Agent] Skill activation successful, starting step execution...")
                                 
                                 # Extract steps from the activated skill
-                                if hasattr(self, '_current_skill_steps') and self._current_skill_steps:
+                                has_steps = hasattr(self, '_current_skill_steps') and self._current_skill_steps
+                                logger.info(f"[Agent] Has steps attribute: {has_steps}")
+                                
+                                if has_steps:
                                     logger.info(f"[Agent] Found {len(self._current_skill_steps)} steps to execute")
+                                    logger.info(f"[Agent] Steps list: {self._current_skill_steps}")
                                     
                                     # IMPORTANT: Don't continue the loop (which would call LLM again)
                                     # Instead, directly execute the first step script
@@ -1350,6 +1516,7 @@ Don't repeat this if `bot_name` already exists in memory.
                                     # Extract skill name from forced_tool_call arguments
                                     skill_args = json.loads(forced_tool_call.function.arguments) if isinstance(forced_tool_call.function.arguments, str) else forced_tool_call.function.arguments
                                     skill_name = skill_args.get("skill_name", "static-troubleshooting")
+                                    logger.info(f"[Agent] Skill name: {skill_name}")
                                     
                                     # Build parameters for the step script
                                     # execute_step_script expects: script_name, mode, params
@@ -1363,32 +1530,54 @@ Don't repeat this if `bot_name` already exists in memory.
                                         "检查本静态路由的优先级": "check_priority"
                                     }
                                     analysis_type = step_to_analysis_type.get(first_step_name, "check_route")
+                                    logger.info(f"[Agent] Analysis type: {analysis_type}")
                                     
                                     # Extract destination network from context or use default
                                     destination_network = "0.0.0.0/0"  # Default
                                     for msg in self.messages[-10:]:
                                         if msg.get("role") == "user":
                                             content = msg.get("content", "")
-                                            # Try to extract CIDR notation
+                                            # Try to extract CIDR notation or plain IP address
                                             import re
-                                            dest_match = re.search(r'([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2})', content)
-                                            if dest_match:
-                                                destination_network = dest_match.group(1)
-                                                logger.info(f"[Agent] Extracted destination_network: {destination_network}")
+                                            
+                                            # First, try to find IP after "目的网段" or "目标网段" keywords
+                                            dest_keyword_match = re.search(r'(目的网段|目标网段|目的IP)\s*[：:]?\s*([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)', content)
+                                            if dest_keyword_match:
+                                                destination_network = dest_keyword_match.group(2)
+                                                logger.info(f"[Agent] Extracted destination_network after keyword: {destination_network}")
                                                 break
+                                            
+                                            # If no keyword found, find the last IP address in the message (usually destination)
+                                            ip_matches = re.findall(r'([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)', content)
+                                            if ip_matches:
+                                                # Use the last IP as destination (first is often device IP)
+                                                destination_network = ip_matches[-1]
+                                                logger.info(f"[Agent] Extracted last IP as destination_network: {destination_network}")
+                                                break
+                                   
+                                    # Keep destination network as-is without adding mask
+                                    logger.info(f"[Agent] Destination network: {destination_network}")
                                     
                                     # Extract device info from context
                                     device_info = self._extract_device_info_from_context()
+                                    logger.info(f"[Agent] Extracted device info: {device_info}")
+                                    
+                                    # Get actual step number from SKILL.md
+                                    actual_step_number = self._current_skill_step_numbers[0] if self._current_skill_step_numbers else 1
+                                    logger.info(f"[Agent] Actual step number from SKILL.md: {actual_step_number}")
+                                    
                                     step_params = {
                                         "step_name": first_step_name,
-                                        "step_number": 1,
+                                        "step_number": actual_step_number,
                                         "skill_name": skill_name,
                                         "analysis_type": analysis_type,
                                         "destination_network": destination_network,
                                         "device_info": device_info,
                                         "context_id": skill_args.get("context_id", ""),
-                                        "question_no": skill_args.get("question_no", "")
+                                        "question_no": skill_args.get("question_no", ""),
+                                        "session_id": self.session_id or "default"
                                     }
+                                    logger.info(f"[Agent] Step params built successfully")
                                     
                                     # Arguments must match execute_step_script signature: (script_name, mode, params)
                                     step_args_json = json.dumps({
@@ -1396,6 +1585,7 @@ Don't repeat this if `bot_name` already exists in memory.
                                         "mode": "build_and_execute",
                                         "params": step_params
                                     })
+                                    logger.info(f"[Agent] Step arguments JSON prepared")
                                     
                                     step_tool_call = MockToolCall(
                                         id=f"call_step_1_{int(time.time())}",
@@ -1404,54 +1594,309 @@ Don't repeat this if `bot_name` already exists in memory.
                                     )
 
                                     # Execute the step script
+                                    logger.info(f"[Agent] Executing step script: execute_step_script with params: {step_params}")
                                     step_result = self._execute_tool_call(step_tool_call)
-                                    logger.info(f"[Agent] Step execution result (first 200 chars): {step_result[:200]}")
+                                    logger.info(f"[Agent] Step script execution completed")
+                                    
+                                    # Log step result with proper type handling
+                                    try:
+                                        if step_result is None:
+                                            logger.info("[Agent] Step execution result: None")
+                                        else:
+                                            result_str = str(step_result)
+                                            logger.info(f"[Agent] Step execution result type: {type(step_result).__name__}")
+                                            logger.info(f"[Agent] Step execution result length: {len(result_str)} chars")
+                                            logger.info(f"[Agent] Step execution result:\n{result_str}")
+                                    except Exception as e:
+                                        logger.warning(f"[Agent] Failed to log step result: {e}")
+                                    
+                                    # Parse step result to determine response
+                                    answer_type = None
+                                    user_message = ""
+                                    parsed = None
+                                    try:
+                                        import json as _json
+                                        if isinstance(step_result, str):
+                                            parsed = _json.loads(step_result)
+                                            answer_type = parsed.get("answerType")
+                                            user_message = parsed.get("message", parsed.get("user_message", ""))
+                                            logger.info(f"[Agent] Parsed step result - answer_type: {answer_type}, user_message: {user_message[:100] if user_message else 'None'}")
+                                    except Exception as e:
+                                        logger.warning(f"[Agent] Failed to parse step result: {e}")
                                     
                                     # Send step notification and command to frontend
                                     # Send step notification and analysis result to frontend
+                                    logger.info(f"[Agent] Checking if on_token is available: {on_token is not None}")
                                     if on_token:
+                                        logger.info(f"[Agent] on_token is available, sending stepContent")
                                         # Send stepName
                                         step_marker = f"[STEP_START]{first_step_name}[STEP_END]"
                                         logger.info(f"[SkillSteps] Sending proactive step notification for step 1: {first_step_name}")
                                         on_token(step_marker)
                                         
-                                        # Send stepAnalysis result (script already executed commands and analyzed)
-                                        try:
-                                            import json as _json
-                                            if isinstance(step_result, str):
-                                                parsed = _json.loads(step_result)
-                                                if parsed.get("answerType") == "stepAnalysis":
-                                                    logger.info("[Agent] Sending stepAnalysis to frontend")
-                                                    on_token(step_result)
-                                                elif parsed.get("answerType") == "stepCommand":
-                                                    # Fallback: if still getting stepCommand, log warning
-                                                    logger.warning("[Agent] Received stepCommand instead of stepAnalysis - script may not be executing correctly")
-                                                    on_token(step_result)
-                                        except Exception as e:
-                                            logger.warning(f"[Agent] Failed to parse step result: {e}")
+                                        # Send the appropriate message based on answer_type
+                                        if answer_type == "stepContent":
+                                            logger.info("[Agent] Sending stepContent to frontend")
+                                            on_token(step_result)
+                                        elif answer_type == "stepAnalysis":
+                                            logger.info("[Agent] Sending stepAnalysis to frontend")
+                                            on_token(step_result)
+                                        elif answer_type == "stepCommand":
+                                            # Fallback: if still getting stepCommand, log warning
+                                            logger.warning("[Agent] Received stepCommand instead of stepContent - script may not be executing correctly")
+                                            on_token(step_result)
+                                        elif answer_type == "stepInfoRequest":
+                                            logger.info("[Agent] Sending stepInfoRequest to frontend - need additional information")
+                                            on_token(step_result)
+                                        elif answer_type == "stepError":
+                                            error_msg = user_message or (parsed.get('message', 'Unknown error') if parsed else 'Unknown error')
+                                            logger.warning(f"[Agent] Step execution error: {error_msg}")
+                                            on_token(step_result)
+                                        elif answer_type is not None:
+                                            logger.warning(f"[Agent] Unknown answerType: {answer_type}, sending as-is")
+                                            on_token(step_result)
+                                        else:
+                                            logger.warning("[Agent] No answerType found in step result")
 
                                         # IMPORTANT: Return empty string to pause execution and wait for user input
                                     # Do NOT continue the loop - let the user decide whether to proceed
-                                    logger.info("[Agent] Step 1 execution complete, returning control to user")
+                                    logger.info("[Agent] Step execution complete, checking answer_type...")
                                     
-
+                                    # Update step index after successful execution (not for stepInfoRequest)
+                                    if answer_type != "stepInfoRequest":
+                                        session_id_for_step = self.session_id or "default"
+                                        current_idx = self._session_step_indices.get(session_id_for_step, 0)
+                                        self._session_step_indices[session_id_for_step] = current_idx + 1
+                                        logger.info(f"[Agent] Session {session_id_for_step}: Updated step index to: {self._session_step_indices[session_id_for_step]}")
                                     
-                                    # Add messages to history
-                                    msg_dump = message.model_dump()
-                                    if msg_dump.get("content") is None:
-                                        msg_dump["content"] = ""
-                                    self.messages.append(msg_dump)
+                                    # For stepAnalysis, stepContent, stepCommand, continue to next step automatically
+                                    # Only pause for stepInfoRequest (need user input) or stepError
+                                    logger.info(f"[Agent] Checking answer_type: {answer_type}, in allowed types: {answer_type in ('stepAnalysis', 'stepContent', 'stepCommand')}")
+                                    if answer_type in ("stepAnalysis", "stepContent", "stepCommand"):
+                                        logger.info(f"[Agent] answer_type={answer_type}, continuing to next step...")
+                                        
+                                        # Add messages to history
+                                        msg_dump = message.model_dump()
+                                        if msg_dump.get("content") is None:
+                                            msg_dump["content"] = ""
+                                        self.messages.append(msg_dump)
+                                        
+                                        self.messages.append({
+                                            "role": "tool",
+                                            "tool_call_id": forced_tool_call.id,
+                                            "name": forced_tool_call.function.name,
+                                            "content": result,
+                                        })
+                                        
+                                        # Send step result to frontend via on_token if available
+                                        if on_token:
+                                            step_analysis_marker = f"[STEP_RESULT]{result}[STEP_RESULT_END]"
+                                            on_token(step_analysis_marker)
+                                        
+                                        # Directly execute next step without calling LLM
+                                        # Continue the step execution loop until all steps done or need user input
+                                        while True:
+                                            session_id_for_step = self.session_id or "default"
+                                            
+                                            # Get next step from analysis result if available
+                                            next_step_name = None
+                                            next_step_number = None
+                                            current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
+                                            
+                                            # Parse current result to get next_step from analysis or nextStep field
+                                            try:
+                                                current_parsed = json.loads(result) if isinstance(result, str) else result
+                                                if current_parsed:
+                                                    # Check both old format (analysis.next_step) and new format (nextStep)
+                                                    analysis_next_step = None
+                                                    if "analysis" in current_parsed:
+                                                        analysis_next_step = current_parsed["analysis"].get("next_step")
+                                                    # Fall back to new format
+                                                    if not analysis_next_step:
+                                                        analysis_next_step = current_parsed.get("nextStep")
+                                                    
+                                                    if analysis_next_step:
+                                                        # Convert next_step like "step2" to step index
+                                                        match = re.search(r'step(\d+)', analysis_next_step)
+                                                        if match:
+                                                            next_step_number = int(match.group(1))
+                                                            # Find the step name by looking for the step number in _current_skill_step_numbers
+                                                            try:
+                                                                next_step_idx = self._current_skill_step_numbers.index(next_step_number)
+                                                                if 0 <= next_step_idx < len(self._current_skill_steps):
+                                                                    next_step_name = self._current_skill_steps[next_step_idx]
+                                                                    logger.info(f"[Agent] Jumping to step {next_step_number}: {next_step_name} (from {'analysis.next_step' if 'analysis' in current_parsed else 'nextStep'})")
+                                                            except ValueError:
+                                                                logger.warning(f"[Agent] Step number {next_step_number} not found in _current_skill_step_numbers")
+                                            except Exception as e:
+                                                logger.warning(f"[Agent] Failed to parse next_step from analysis: {e}")
+                                            
+                                            # If no next_step from analysis, use sequential execution
+                                            if not next_step_name:
+                                                current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
+                                                if current_step_idx >= len(self._current_skill_steps):
+                                                    logger.info(f"[Agent] All steps completed, exiting step execution loop")
+                                                    # Skill execution complete, clear skill state
+                                                    self._current_skill_steps = []
+                                                    self._current_skill_step_numbers = []
+                                                    self._session_step_indices.pop(session_id_for_step, None)
+                                                    # Return completion message
+                                                    return "所有故障排查步骤执行完成。"
+                                                next_step_name = self._current_skill_steps[current_step_idx]
+                                                # Get actual step number from SKILL.md
+                                                next_step_number = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
+                                                logger.info(f"[Agent] Executing next step sequentially: step {next_step_number}: {next_step_name}")
+                                            else:
+                                                # Find the index of the step with this number
+                                                try:
+                                                    next_step_idx = self._current_skill_step_numbers.index(next_step_number)
+                                                    current_step_idx = next_step_idx
+                                                except ValueError:
+                                                    # If not found, use the number directly
+                                                    current_step_idx = next_step_number - 1
+                                                self._session_step_indices[session_id_for_step] = current_step_idx
+                                            
+                                            # Check if this is the final step (step 7 - 流程结束与总结)
+                                            max_step_number = max(self._current_skill_step_numbers) if self._current_skill_step_numbers else 7
+                                            if next_step_number == max_step_number or "流程结束" in next_step_name or "总结" in next_step_name:
+                                                logger.info(f"[Agent] Reached final step {next_step_number}: {next_step_name}, ending troubleshooting flow")
+                                                # Clear skill state
+                                                self._current_skill_steps = []
+                                                self._current_skill_step_numbers = []
+                                                self._session_step_indices.pop(session_id_for_step, None)
+                                                # Return completion message in conversation format
+                                                completion_result = {
+                                                    "answerType": "conversation",
+                                                    "contextEnd": "false",
+                                                    "contextId": skill_args.get("context_id", ""),
+                                                    "currentStep": next_step_number,
+                                                    "message": "静态路由故障排查完成。\n\n诊断结果：已完成所有故障排查步骤。\n\n建议：根据各步骤分析结果进行相应配置调整。",
+                                                    "questionNo": skill_args.get("question_no", ""),
+                                                    "sessionId": self.session_id or "default"
+                                                }
+                                                return json.dumps(completion_result, ensure_ascii=False)
+                                            
+                                            logger.info(f"[Agent] Executing next step directly: step {next_step_number}: {next_step_name}")
+                                            
+                                            # Map step numbers to analysis types
+                                            step_to_analysis_type = {
+                                                1: "check_route",
+                                                2: "check_nexthop",
+                                                3: "check_mask",
+                                                4: "check_interface",
+                                                5: "check_bfd",
+                                                6: "check_priority"
+                                            }
+                                            
+                                            # Determine the correct analysis type for this step
+                                            next_analysis_type = step_to_analysis_type.get(next_step_number, analysis_type)
+                                            logger.info(f"[Agent] Step {next_step_number} using analysis_type: {next_analysis_type}")
+                                            
+                                            # Build next step params (reuse same device_info and destination_network)
+                                            next_step_params = {
+                                                "step_name": next_step_name,
+                                                "step_number": next_step_number,
+                                                "skill_name": skill_name,
+                                                "analysis_type": next_analysis_type,
+                                                "destination_network": destination_network,
+                                                "device_info": device_info,
+                                                "context_id": skill_args.get("context_id", ""),
+                                                "question_no": skill_args.get("question_no", ""),
+                                                "session_id": self.session_id or "default"
+                                            }
+                                            
+                                            # Create next step tool call
+                                            next_step_args_json = json.dumps({
+                                                "script_name": "step_executor.py",
+                                                "mode": "build_and_execute",
+                                                "params": next_step_params
+                                            })
+                                            
+                                            next_step_tool_call = MockToolCall(
+                                                id=f"call_step_{next_step_number}_{int(time.time())}",
+                                                function=MockFunction(name="execute_step_script", arguments=next_step_args_json),
+                                                type="function"
+                                            )
+                                            
+                                            # Execute next step directly
+                                            next_step_result = self._execute_tool_call(next_step_tool_call)
+                                            
+                                            # Parse next step result
+                                            try:
+                                                next_parsed = json.loads(next_step_result) if isinstance(next_step_result, str) else next_step_result
+                                                next_answer_type = next_parsed.get("answerType") if next_parsed else None
+                                            except:
+                                                next_answer_type = None
+                                            
+                                            # Send next step result to frontend
+                                            if on_token:
+                                                step_marker = f"[STEP_START]{next_step_name}[STEP_END]"
+                                                on_token(step_marker)
+                                                on_token(next_step_result)
+                                            
+                                            # Update step index
+                                            self._session_step_indices[session_id_for_step] = current_step_idx + 1
+                                            
+                                            # Check if need to pause for user input
+                                            if next_answer_type == "stepInfoRequest":
+                                                logger.info("[Agent] Next step requires user input, pausing")
+                                                # Add tool result to messages
+                                                self.messages.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": next_step_tool_call.id,
+                                                    "name": next_step_tool_call.function.name,
+                                                    "content": next_step_result,
+                                                })
+                                                return next_parsed.get("message", "请提供必要的信息。")
+                                            elif next_answer_type == "stepError":
+                                                logger.info("[Agent] Next step encountered error")
+                                                self.messages.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": next_step_tool_call.id,
+                                                    "name": next_step_tool_call.function.name,
+                                                    "content": next_step_result,
+                                                })
+                                                return f"步骤执行错误: {next_parsed.get('message', 'Unknown error')}"
+                                            
+                                            # stepAnalysis, stepContent or stepCommand - continue to next step
+                                            logger.info(f"[Agent] Next step completed with answer_type={next_answer_type}, continuing...")
+                                            self.messages.append({
+                                                "role": "tool",
+                                                "tool_call_id": next_step_tool_call.id,
+                                                "name": next_step_tool_call.function.name,
+                                                "content": next_step_result,
+                                            })
+                                            # Update result to current step result for next iteration
+                                            result = next_step_result
+                                            # Loop continues to execute next step
+                                    else:
+                                        # Determine what to return to the user for stepInfoRequest or stepError
+                                        return_message = ""
+                                        if answer_type == "stepInfoRequest" and user_message:
+                                            # Return user-friendly message for direct HTTP responses (e.g., Postman)
+                                            return_message = user_message
+                                            logger.info(f"[Agent] Returning user message: {return_message[:100]}...")
+                                        elif answer_type == "stepError":
+                                            return_message = f"步骤执行错误: {user_message}"
+                                        elif answer_type is not None:
+                                            return_message = f"步骤执行完成，类型: {answer_type}"
+                                        
+                                        # Add messages to history
+                                        msg_dump = message.model_dump()
+                                        if msg_dump.get("content") is None:
+                                            msg_dump["content"] = ""
+                                        self.messages.append(msg_dump)
+                                        
+                                        self.messages.append({
+                                            "role": "tool",
+                                            "tool_call_id": forced_tool_call.id,
+                                            "name": forced_tool_call.function.name,
+                                            "content": result,
+                                        })
+                                        
+                                        # Return appropriate message to indicate we're waiting for user input
+                                        return return_message
                                     
-                                    self.messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": forced_tool_call.id,
-                                        "name": forced_tool_call.function.name,
-                                        "content": result,
-                                    })
-                                    
-                                    # Return empty string to indicate we're waiting for user input
-                                    return ""
-                                else:
                                     logger.warning("[Agent] No steps extracted from skill")
                                     # Fall through to normal processing
                             else:
@@ -1612,9 +2057,10 @@ Don't repeat this if `bot_name` already exists in memory.
                             except Exception as e:
                                 logger.warning(f"[Agent] Failed to send stepCommand: {e}")
 
-                # If we sent a stepCommand, pause execution and wait for frontend to send analysis result
+                # If we sent a stepCommand, do NOT pause - continue execution to wait for frontend to send analysis result
+                # But we need to add the tool result to messages so the next LLM call can process it
                 if has_step_command:
-                    logger.info("[Agent] Pausing execution, waiting for frontend to send step analysis result")
+                    logger.info("[Agent] stepCommand sent to frontend, continuing execution to wait for analysis result")
                     # Add tool results to message history
                     for tc in tool_calls:
                         if tc.id not in results:
@@ -1627,17 +2073,17 @@ Don't repeat this if `bot_name` already exists in memory.
                             "tool_call_id": tc.id,
                             "content": results[tc.id],
                         })
-                    
+
                     # Inject pending injections
                     for injection in self.pending_injections:
                         self.messages.append(
                             {"role": "system", "content": injection}
                         )
                     self.pending_injections = []
-                    
-                    # Return empty string to indicate pause
-                    # The conversation will continue when frontend sends analysis result
-                    return ""
+
+                    # Do NOT return here - continue the loop to wait for frontend to send analysis result
+                    # The frontend will send the analysis result as a new user message
+                    continue
 
                 for tc in tool_calls:
                     if tc.id not in results:
@@ -1707,6 +2153,8 @@ Don't repeat this if `bot_name` already exists in memory.
                     r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
                     r'IP[:\s]+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
                     r'设备[:\s]*IP[:\s]*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
+                    r'设备[:\s]*ip[:\s]*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',  # Lowercase "ip"
+                    r'设备IP[:\s]*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
                 ]
                 
                 for pattern in ip_patterns:
@@ -1742,7 +2190,7 @@ Don't repeat this if `bot_name` already exists in memory.
                         device_info["password"] = match.group(1)
                         logger.info(f"[DeviceInfo] Extracted password: {'*' * len(device_info['password'])}")
                         break
-                
+
                 # Extract port if specified
                 port_match = re.search(r'(?:端口|port)[:\s]*(\d+)', combined_text, re.IGNORECASE)
                 if port_match:
@@ -1751,17 +2199,54 @@ Don't repeat this if `bot_name` already exists in memory.
                         logger.info(f"[DeviceInfo] Extracted port: {device_info['port']}")
                     except ValueError:
                         pass
-                
+
                 # Extract protocol if specified
                 protocol_match = re.search(r'(?:协议|protocol)[:\s]*(telnet|ssh|http|https)', combined_text, re.IGNORECASE)
                 if protocol_match:
                     device_info["protocol"] = protocol_match.group(1).lower()
                     logger.info(f"[DeviceInfo] Extracted protocol: {device_info['protocol']}")
-                
+
+                # If IP is found, try to load full device info from devices.json
+                if device_info["ip"]:
+                    try:
+                        from pathlib import Path
+                        devices_file = Path(__file__).parent.parent / "file" / "devices.json"
+                        if devices_file.exists():
+                            import json as _json
+                            with open(devices_file, 'r', encoding='utf-8') as f:
+                                devices = _json.load(f)
+                            # Find device by IP
+                            for dev in devices:
+                                if dev.get("ip") == device_info["ip"]:
+                                    # Fill in missing fields from devices.json
+                                    if not device_info.get("username") and dev.get("userName"):
+                                        device_info["username"] = dev["userName"]
+                                        logger.info(f"[DeviceInfo] Loaded username from devices.json: {device_info['username']}")
+                                    if not device_info.get("password") and dev.get("password"):
+                                        device_info["password"] = dev["password"]
+                                        logger.info(f"[DeviceInfo] Loaded password from devices.json")
+                                    if not device_info.get("port") or device_info["port"] == 23:
+                                        if dev.get("port"):
+                                            device_info["port"] = dev["port"]
+                                    if not device_info.get("protocol") or device_info["protocol"] == "telnet":
+                                        if dev.get("protocol"):
+                                            device_info["protocol"] = dev["protocol"]
+                                    # Load deviceId as uuid for API sessionId
+                                    if not device_info.get("uuid") and dev.get("deviceId"):
+                                        device_info["uuid"] = dev["deviceId"]
+                                        logger.info(f"[DeviceInfo] Loaded uuid (deviceId) from devices.json: {device_info['uuid']}")
+                                    break
+                            else:
+                                logger.info(f"[DeviceInfo] Device {device_info['ip']} not found in devices.json")
+                        else:
+                            logger.warning(f"[DeviceInfo] devices.json not found at {devices_file}")
+                    except Exception as e:
+                        logger.warning(f"[DeviceInfo] Failed to load device info from devices.json: {e}")
+
                 # If IP is still empty, log warning
                 if not device_info["ip"]:
                     logger.warning("[DeviceInfo] Could not extract IP address from context")
-                
+
                 return device_info
 
         # This should never be reached

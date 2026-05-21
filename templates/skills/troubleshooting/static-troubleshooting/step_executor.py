@@ -22,20 +22,71 @@ TERMINAL_API_BASE_URL = "http://10.153.61.64/terminal/api/terminal/ai"
 DEVICE_INFO_ENDPOINT = f"{TERMINAL_API_BASE_URL}/deviceInfo"
 
 
+# Field templates for different analysis types
+INFO_REQUEST_FIELDS = {
+    "check_route": [
+        {"name": "device_ip", "label": "设备IP地址", "type": "text", "placeholder": "例如: 192.168.1.1", "required": True},
+        {"name": "destination_network", "label": "目的网段", "type": "text", "placeholder": "例如: 192.168.1.0/24 或 10.0.0.0/8", "required": True},
+    ],
+    "switch_troubleshooting": [
+        {"name": "pc1_ip", "label": "PC1的IP地址", "type": "text", "placeholder": "例如: 192.168.1.10", "required": True},
+        {"name": "pc1_mac", "label": "PC1的MAC地址", "type": "text", "placeholder": "例如: 00-11-22-33-44-55", "required": True},
+        {"name": "pc2_ip", "label": "PC2的IP地址", "type": "text", "placeholder": "例如: 192.168.2.10", "required": True},
+        {"name": "pc2_mac", "label": "PC2的MAC地址", "type": "text", "placeholder": "例如: 00-11-22-33-44-66", "required": True},
+        {"name": "access_switch", "label": "PC1连接的接入交换机", "type": "text", "placeholder": "例如: Switch-A", "required": True},
+        {"name": "access_port", "label": "接入交换机接口号", "type": "text", "placeholder": "例如: GigabitEthernet0/1", "required": True},
+        {"name": "target_port", "label": "待检查的接入交换机接口", "type": "text", "placeholder": "例如: GigabitEthernet0/2", "required": True},
+        {"name": "agg_switch", "label": "汇聚交换机", "type": "text", "placeholder": "例如: Switch-B", "required": True},
+        {"name": "core_switch", "label": "核心交换机", "type": "text", "placeholder": "例如: Core-Switch", "required": True},
+        {"name": "pc1_vlan", "label": "PC1所属VLAN", "type": "text", "placeholder": "例如: 10", "required": True},
+        {"name": "pc2_vlan", "label": "PC2所属VLAN", "type": "text", "placeholder": "例如: 20", "required": True},
+        {"name": "rate_limit_port", "label": "核心交换机限速接口名称", "type": "text", "placeholder": "例如: GigabitEthernet0/1", "required": True},
+        {"name": "rate_limit_value", "label": "当前限速值", "type": "text", "placeholder": "例如: 1000", "required": True},
+        {"name": "qos_policy", "label": "QoS策略名称", "type": "text", "placeholder": "例如: qos-policy-1", "required": True},
+    ],
+    "default": [
+        {"name": "device_ip", "label": "设备IP地址", "type": "text", "placeholder": "例如: 192.168.1.1", "required": True},
+        {"name": "destination_network", "label": "目的网段", "type": "text", "placeholder": "例如: 192.168.1.0/24", "required": True},
+    ]
+}
+
+
+def get_info_request_fields(analysis_type: str) -> list:
+    """Get the field list for a specific analysis type."""
+    return INFO_REQUEST_FIELDS.get(analysis_type, INFO_REQUEST_FIELDS.get("default", []))
+
+
 def load_devices_config(devices_file_path: str = None) -> list:
     """Load device configuration from devices.json file."""
     if devices_file_path is None:
-        project_root = Path(__file__).parent.parent.parent.parent.parent
-        devices_file_path = project_root / "file" / "devices.json"
+        # Try multiple possible paths
+        possible_paths = [
+            Path(__file__).parent.parent.parent.parent.parent / "file" / "devices.json",
+            Path(__file__).parent.parent.parent.parent.parent.parent / "file" / "devices.json",
+            Path("/config/file/devices.json"),
+            Path("f:/workspace/project/H3C/pythonclaw/file/devices.json"),
+        ]
+        
+        print(f"# Looking for devices.json in: {[str(p) for p in possible_paths]}", file=sys.stderr)
+        
+        devices_path = None
+        for p in possible_paths:
+            if p.exists():
+                devices_path = p
+                print(f"# Found devices.json at: {devices_path}", file=sys.stderr)
+                break
+        
+        if devices_path is None:
+            raise FileNotFoundError(f"Devices config file not found in any of: {possible_paths}")
+    else:
+        devices_path = Path(devices_file_path)
     
-    devices_path = Path(devices_file_path)
-    
-    if not devices_path.exists():
-        raise FileNotFoundError(f"Devices config file not found: {devices_path}")
+    print(f"# Loading devices from: {devices_path}", file=sys.stderr)
     
     with open(devices_path, 'r', encoding='utf-8') as f:
         devices = json.load(f)
     
+    print(f"# Loaded {len(devices)} devices", file=sys.stderr)
     return devices
 
 
@@ -85,13 +136,8 @@ def execute_device_command(
     # Log complete request details
     print(f"# [API Request] Endpoint: {DEVICE_INFO_ENDPOINT}", file=sys.stderr)
     print(f"# [API Request] Payload:", file=sys.stderr)
-    print(f"#   Commands: {commands}", file=sys.stderr)
-    print(f"#   Device IP: {device_info.get('ip', 'N/A')}", file=sys.stderr)
-    print(f"#   Device Port: {device_info.get('port', 'N/A')}", file=sys.stderr)
-    print(f"#   Protocol: {device_info.get('protocol', 'N/A')}", file=sys.stderr)
-    print(f"#   Username: {device_info.get('username', 'N/A')}", file=sys.stderr)
-    print(f"#   Password: {'*' * len(device_info.get('password', '')) if device_info.get('password') else 'N/A'}", file=sys.stderr)
-    print(f"#   Session ID: {session_id}", file=sys.stderr)
+    # Output payload as-is for debugging structure
+    print(f"#   {json.dumps(payload, ensure_ascii=False, indent=2)}", file=sys.stderr)
     
     try:
         response = requests.post(
@@ -235,6 +281,57 @@ def extract_command_output(api_response: Dict[str, Any]) -> str:
         return ""
 
 
+def extract_nexthop_from_route(api_response: Dict[str, Any], destination_network: str) -> str:
+    """Extract nexthop IP from routing table response."""
+    try:
+        # Extract the route output from API response
+        route_output = extract_command_output(api_response)
+        if not route_output:
+            return ""
+        
+        print(f"# [extract_nexthop] Route output: {route_output[:200]}", file=sys.stderr)
+        
+        # Parse H3C routing table format
+        # Format: Destination/Mask   Proto   Pre Cost        NextHop         Interface
+        lines = route_output.strip().split('\n')
+        
+        # Extract destination network without subnet mask for comparison
+        dest_ip = destination_network.split('/')[0] if '/' in destination_network else destination_network
+        
+        for line in lines:
+            # Look for lines containing IP addresses (potential route entries)
+            if re.search(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', line):
+                # Split by whitespace
+                parts = re.split(r'\s+', line.strip())
+                if len(parts) >= 5:
+                    # parts[0] = Destination/Mask
+                    # parts[1] = Proto
+                    # parts[2] = Pre
+                    # parts[3] = Cost
+                    # parts[4] = NextHop
+                    dest_mask = parts[0]
+                    nexthop = parts[4]
+                    
+                    # Check if this line matches our destination network
+                    if dest_ip in dest_mask:
+                        print(f"# [extract_nexthop] Found matching route: {dest_mask} -> {nexthop}", file=sys.stderr)
+                        return nexthop
+        
+        # If no specific match, try to find any static route nexthop
+        for line in lines:
+            parts = re.split(r'\s+', line.strip())
+            if len(parts) >= 5 and parts[1].lower() == 'static':
+                print(f"# [extract_nexthop] Found static route nexthop: {parts[4]}", file=sys.stderr)
+                return parts[4]
+        
+        print(f"# [extract_nexthop] No nexthop found in route output", file=sys.stderr)
+        return ""
+        
+    except Exception as e:
+        print(f"# [extract_nexthop] Failed to extract nexthop: {e}", file=sys.stderr)
+        return ""
+
+
 # ============================================================================
 # Command Template Engine
 # ============================================================================
@@ -312,7 +409,7 @@ STEP_COMMAND_TEMPLATES = {
         "ping {{nexthop_ip}}"
     ],
     "check_mask": [
-        "display ip routing-table {{destination_network}}"
+        "display ip routing-table"
     ],
     "check_interface": [
         "display interface brief"
@@ -322,8 +419,8 @@ STEP_COMMAND_TEMPLATES = {
         "display track all"
     ],
     "check_priority": [
-        "display ip routing-table {{destination_network}}",
-        "display ip routing-table {{destination_network}} verbose"
+        "display ip routing-table",
+        "display ip routing-table verbose"
     ]
 }
 
@@ -343,8 +440,16 @@ def analyze_check_route_result(response_data: str) -> Dict[str, Any]:
         "message": ""
     }
     
-    if "Routing Table" in response_data or "Destinations" in response_data:
-        if "Static" in response_data or "Direct" in response_data:
+    # Check if response contains routing table entries
+    # H3C routing table format: "Destination/Mask   Proto   Pre Cost        NextHop         Interface"
+    if "Destination/Mask" in response_data or "Summary count" in response_data:
+        # Check if there are any route entries (lines with IP addresses)
+        # Look for lines that match IP address pattern
+        import re
+        ip_pattern = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
+        has_route_entries = bool(re.search(ip_pattern, response_data))
+        
+        if has_route_entries:
             result["route_exists"] = True
             result["status"] = "success"
             result["next_step"] = "step2"
@@ -352,18 +457,17 @@ def analyze_check_route_result(response_data: str) -> Dict[str, Any]:
         else:
             result["route_exists"] = False
             result["status"] = "not_found"
-            result["next_step"] = "step5"
+            result["next_step"] = "step4"
             result["message"] = "路由表中未找到该静态路由，需要检查静态路由配置"
+    elif "not found" in response_data.lower() or "no route" in response_data.lower():
+        result["route_exists"] = False
+        result["status"] = "not_found"
+        result["next_step"] = "step5"
+        result["message"] = "设备返回：路由不存在，跳转到检查静态路由配置"
     else:
-        if "not found" in response_data.lower() or "no route" in response_data.lower():
-            result["route_exists"] = False
-            result["status"] = "not_found"
-            result["next_step"] = "step5"
-            result["message"] = "设备返回：路由不存在，跳转到检查静态路由配置"
-        else:
-            result["status"] = "error"
-            result["next_step"] = "retry"
-            result["message"] = "无法解析路由表回显，请重试或手动检查"
+        result["status"] = "error"
+        result["next_step"] = "step7"
+        result["message"] = "无法解析路由表回显，跳转到总结步骤"
     
     return result
 
@@ -388,12 +492,12 @@ def analyze_check_nexthop_result(response_data: str) -> Dict[str, Any]:
     elif "timeout" in response_data.lower() or "unreachable" in response_data.lower():
         result["reachable"] = False
         result["status"] = "unreachable"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "下一跳地址不可达，需要排查链路问题"
     else:
         result["status"] = "error"
-        result["next_step"] = "retry"
-        result["message"] = "无法解析ping回显，请重试"
+        result["next_step"] = "step7"
+        result["message"] = "无法解析ping回显，跳转到总结步骤"
     
     return result
 
@@ -412,12 +516,12 @@ def analyze_check_mask_result(response_data: str) -> Dict[str, Any]:
     if "Routing Table" in response_data:
         result["mask_correct"] = True
         result["status"] = "success"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "路由掩码配置正确，排查流程结束"
     else:
         result["mask_correct"] = False
         result["status"] = "warning"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "未发现明显掩码问题，建议人工确认"
     
     return result
@@ -426,7 +530,7 @@ def analyze_check_mask_result(response_data: str) -> Dict[str, Any]:
 def analyze_check_interface_result(response_data: str) -> Dict[str, Any]:
     """Analyze interface status."""
     result = {
-        "step": 5,
+        "step": 4,
         "step_name": "检查出接口物理与协议状态",
         "status": "",
         "interface_up": False,
@@ -437,17 +541,17 @@ def analyze_check_interface_result(response_data: str) -> Dict[str, Any]:
     if "UP" in response_data and "DOWN" not in response_data:
         result["interface_up"] = True
         result["status"] = "success"
-        result["next_step"] = "step6"
+        result["next_step"] = "step5"
         result["message"] = "接口状态正常，继续检查BFD/NQA配置"
     elif "DOWN" in response_data:
         result["interface_up"] = False
         result["status"] = "down"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "接口状态异常，需要修复接口"
     else:
         result["status"] = "error"
-        result["next_step"] = "retry"
-        result["message"] = "无法解析接口状态，请重试"
+        result["next_step"] = "step7"
+        result["message"] = "无法解析接口状态，跳转到总结步骤"
     
     return result
 
@@ -455,7 +559,7 @@ def analyze_check_interface_result(response_data: str) -> Dict[str, Any]:
 def analyze_check_bfd_result(response_data: str) -> Dict[str, Any]:
     """Analyze BFD/NQA status."""
     result = {
-        "step": 6,
+        "step": 5,
         "step_name": "检查BFD或NQA配置与状态",
         "status": "",
         "bfd_enabled": False,
@@ -466,7 +570,7 @@ def analyze_check_bfd_result(response_data: str) -> Dict[str, Any]:
     if "BFD" in response_data or "Track" in response_data:
         result["bfd_enabled"] = True
         result["status"] = "success"
-        result["next_step"] = "step7"
+        result["next_step"] = "step6"
         result["message"] = "BFD/NQA配置存在，继续检查路由优先级"
     else:
         result["bfd_enabled"] = False
@@ -480,7 +584,7 @@ def analyze_check_bfd_result(response_data: str) -> Dict[str, Any]:
 def analyze_check_priority_result(response_data: str) -> Dict[str, Any]:
     """Analyze static route priority."""
     result = {
-        "step": 7,
+        "step": 6,
         "step_name": "检查本静态路由的优先级",
         "status": "",
         "priority_normal": True,
@@ -491,12 +595,12 @@ def analyze_check_priority_result(response_data: str) -> Dict[str, Any]:
     if "Static" in response_data and "Pre" in response_data:
         result["priority_normal"] = True
         result["status"] = "success"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "路由优先级正常，排查流程结束"
     else:
         result["priority_normal"] = False
         result["status"] = "warning"
-        result["next_step"] = "step8"
+        result["next_step"] = "step7"
         result["message"] = "未发现优先级冲突，建议人工确认"
     
     return result
@@ -546,6 +650,8 @@ def main():
         analysis_type = params.get("analysis_type", "")
         step_type = params.get("step_type", "")
         session_id = params.get("session_id", "")
+        destination_network = params.get("destination_network", "")
+        step_number = params.get("step_number", 1)
         
         # Determine the analysis type (use step_type as fallback)
         effective_analysis_type = analysis_type or step_type
@@ -572,12 +678,16 @@ def main():
         
         # Load device information
         device_info = params.get("device_info", {})
+        print(f"# ========== DEVICE INFO LOADING START ==========", file=sys.stderr)
+        print(f"# Input device_info from params: {device_info}", file=sys.stderr)
         
         if isinstance(device_info, str):
             device_info = {"ip": device_info}
+            print(f"# Converted device_info to dict: {device_info}", file=sys.stderr)
         
         # If device_info is still empty or incomplete, try to load from devices.json
-        if not device_info or "ip" not in device_info:
+        ip_is_empty = not device_info.get("ip") or device_info.get("ip", "").strip() == ""
+        if not device_info or "ip" not in device_info or ip_is_empty:
             print(f"# Warning: No device_info provided or incomplete", file=sys.stderr)
             print(f"#   device_info: {device_info}", file=sys.stderr)
             # Try to use first device from devices.json as fallback
@@ -594,31 +704,135 @@ def main():
                     }
                     print(f"# Using first device from devices.json: {device_info['ip']}", file=sys.stderr)
                 else:
-                    print(f"# Error: No devices found in devices.json", file=sys.stderr)
-                    print(json.dumps({"error": "No device information available"}))
-                    sys.exit(1)
+                    print(f"# Warning: No devices found in devices.json, returning stepCommand for frontend execution", file=sys.stderr)
+                    # Return stepCommand instead of error, let frontend execute commands
+                    result = {
+                        "answerType": "stepCommand",
+                        "contextEnd": "false",
+                        "contextId": params.get("context_id", ""),
+                        "currentStep": step_number,
+                        "message": {
+                            "deviceCommds": commands,
+                            "deviceInfo": device_info,
+                            "sessionId": session_id
+                        },
+                        "questionNo": params.get("question_no", ""),
+                        "sessionId": session_id,
+                        "debug": {
+                            "commands": commands,
+                            "note": "No device IP available. Please execute commands manually and call analyze endpoint."
+                        }
+                    }
+                    print(json.dumps(result, ensure_ascii=False))
+                    sys.exit(0)
             except Exception as e:
-                print(f"# Error: Failed to load devices.json: {e}", file=sys.stderr)
-                print(json.dumps({"error": f"Failed to load device configuration: {e}"}))
-                sys.exit(1)
+                print(f"# Warning: Failed to load devices.json: {e}, returning stepCommand", file=sys.stderr)
+                # Return stepCommand instead of error
+                result = {
+                    "answerType": "stepCommand",
+                    "contextEnd": "false",
+                    "contextId": params.get("context_id", ""),
+                    "currentStep": step_number,
+                    "message": {
+                        "deviceCommds": commands,
+                        "deviceInfo": device_info,
+                        "sessionId": session_id
+                    },
+                    "questionNo": params.get("question_no", ""),
+                    "sessionId": session_id,
+                    "debug": {
+                        "commands": commands,
+                        "note": f"Failed to load device config: {e}. Please execute commands manually."
+                    }
+                }
+                print(json.dumps(result, ensure_ascii=False))
+                sys.exit(0)
         elif "ip" in device_info:
-            # Device IP is provided, try to load full info
+            # Device IP is provided, try to load full info from devices.json
             ip_address = device_info["ip"]
-            needs_full_info = not all(k in device_info for k in ["username", "password", "port", "protocol"])
+            needs_full_info = not all(k in device_info and device_info[k] for k in ["username", "password", "port", "protocol"])
+            
+            print(f"# Device IP provided: {ip_address}", file=sys.stderr)
+            print(f"# Needs full info: {needs_full_info}", file=sys.stderr)
+            print(f"# Current device_info: {device_info}", file=sys.stderr)
             
             if needs_full_info:
+                print(f"# Attempting to load device info from devices.json...", file=sys.stderr)
                 try:
                     devices = load_devices_config()
+                    print(f"# Loaded {len(devices)} devices from devices.json", file=sys.stderr)
                     full_device_info = get_device_by_ip(devices, ip_address)
                     
                     if full_device_info:
-                        device_info = {**full_device_info, **device_info}
+                        print(f"# Found device in devices.json: {full_device_info}", file=sys.stderr)
+                        # Only fill in missing fields, don't overwrite existing non-empty values
+                        for key, value in full_device_info.items():
+                            if key not in device_info or not device_info[key]:
+                                device_info[key] = value
                         print(f"# Loaded device info for {ip_address} from devices.json", file=sys.stderr)
+                        print(f"# Updated device_info: {device_info}", file=sys.stderr)
                     else:
                         print(f"# Warning: Device {ip_address} not found in devices.json, using provided info", file=sys.stderr)
                         
                 except Exception as e:
                     print(f"# Warning: Failed to load devices.json: {e}", file=sys.stderr)
+        
+        # Check if we need additional information from frontend
+        original_device_info = params.get("device_info", {})
+        if isinstance(original_device_info, str):
+            original_device_info = {"ip": original_device_info}
+        original_device_ip = original_device_info.get("ip", "")
+        original_device_ip_empty = not original_device_ip or original_device_ip.strip() == ""
+        
+        # Check if destination network is default (not provided by user)
+        destination_network_empty = not destination_network or destination_network == "0.0.0.0/0"
+        
+        # If either device IP or destination network is missing, return info request
+        if original_device_ip_empty or destination_network_empty:
+            print(f"# Information missing, requesting from frontend", file=sys.stderr)
+            print(f"#   Original device IP empty: {original_device_ip_empty}", file=sys.stderr)
+            print(f"#   Destination network empty/default: {destination_network_empty}", file=sys.stderr)
+            
+            missing_fields = []
+            if original_device_ip_empty:
+                missing_fields.append("device_ip")
+            if destination_network_empty:
+                missing_fields.append("destination_network")
+            
+            # Get field list based on analysis type
+            info_fields = get_info_request_fields(effective_analysis_type)
+            
+            # Create user-friendly message
+            missing_fields_display = []
+            if original_device_ip_empty:
+                missing_fields_display.append("设备IP地址")
+            if destination_network_empty:
+                missing_fields_display.append("目的网段")
+            
+            user_message = f"需要补充以下信息以继续故障排查：{', '.join(missing_fields_display)}"
+            if original_device_ip_empty:
+                user_message += "\n- 设备IP地址：例如 192.168.1.1"
+            if destination_network_empty:
+                user_message += "\n- 目的网段：例如 192.168.1.0/24"
+            
+            result = {
+                "answerType": "stepInfoRequest",
+                "contextEnd": "false",
+                "contextId": params.get("context_id", ""),
+                "currentStep": step_number,
+                "missing_fields": missing_fields,
+                "message": user_message,
+                "user_message": user_message,
+                "fields": info_fields,
+                "required_info": {
+                    "device_ip": "设备IP地址",
+                    "destination_network": "目的网段 (例如: 192.168.1.0/24)"
+                },
+                "questionNo": params.get("question_no", ""),
+                "sessionId": session_id
+            }
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(0)
         
         # Step 1: Render command templates
         commands = build_commands_from_templates(commands_templates, params)
@@ -626,73 +840,154 @@ def main():
         for i, cmd in enumerate(commands):
             print(f"#   Command {i+1}: {cmd}", file=sys.stderr)
         
-        # Step 2: Execute commands via Terminal API (batch execution)
-        try:
-            print(f"# Executing {len(commands)} command(s) in batch...", file=sys.stderr)
-            api_response = execute_device_command(commands, device_info, session_id)
+        # For check_nexthop analysis type, we need to extract nexthop_ip from routing table first
+        if effective_analysis_type == "check_nexthop" and "{{nexthop_ip}}" in str(commands):
+            print(f"# [check_nexthop] Need to extract nexthop_ip first", file=sys.stderr)
+            # First, execute the first command (display ip routing-table protocol static {{destination_network}}) to get nexthop
+            route_cmd = commands[0]  # This should be the rendered command with destination_network
+            print(f"# [check_nexthop] Executing route command to get nexthop: {route_cmd}", file=sys.stderr)
             
-            # Extract outputs for each command from the batch response
+            # Build API request for route command
+            route_payload = [{
+                "command": [route_cmd],
+                "device": {
+                    "ip": device_info.get("ip", ""),
+                    "password": device_info.get("password", ""),
+                    "port": device_info.get("port", 23),
+                    "protocol": device_info.get("protocol", "telnet"),
+                    "username": device_info.get("username", "")
+                },
+                "sessionId": device_info.get("uuid") or session_id
+            }]
+            
+            try:
+                route_response = requests.post(
+                    DEVICE_INFO_ENDPOINT,
+                    json=route_payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=30
+                )
+                route_response.raise_for_status()
+                route_result = route_response.json()
+                
+                print(f"# [check_nexthop] Route response: {json.dumps(route_result, ensure_ascii=False)[:500]}", file=sys.stderr)
+                
+                # Extract nexthop_ip from response
+                nexthop_ip = extract_nexthop_from_route(route_result, destination_network)
+                print(f"# [check_nexthop] Extracted nexthop_ip: {nexthop_ip}", file=sys.stderr)
+                
+                if nexthop_ip:
+                    # Add nexthop_ip to params for template rendering
+                    params["nexthop_ip"] = nexthop_ip
+                    # Re-render commands with nexthop_ip
+                    commands = build_commands_from_templates(commands_templates, params)
+                    print(f"# [check_nexthop] Re-rendered commands with nexthop_ip:", file=sys.stderr)
+                    for i, cmd in enumerate(commands):
+                        print(f"#   Command {i+1}: {cmd}", file=sys.stderr)
+                else:
+                    print(f"# [check_nexthop] Could not extract nexthop_ip, skipping ping", file=sys.stderr)
+                    # Remove ping command if nexthop not found
+                    commands = [c for c in commands if "ping" not in c.lower()]
+            except Exception as e:
+                print(f"# [check_nexthop] Failed to get nexthop: {e}", file=sys.stderr)
+                # Continue with original commands
+
+        # Step 2: Execute commands via Terminal API (Direct API Mode)
+        print(f"# ========== API EXECUTION START ==========", file=sys.stderr)
+        print(f"# Executing {len(commands)} command(s) via Terminal API...", file=sys.stderr)
+        try:
+
+            # Build API request payload matching the required structure
+            api_payload = [{
+                "command": commands,  # List of commands
+                "device": {
+                    "ip": device_info.get("ip", ""),
+                    "password": device_info.get("password", ""),
+                    "port": device_info.get("port", 23),
+                    "protocol": device_info.get("protocol", "telnet"),
+                    "username": device_info.get("username", "")
+                },
+                "sessionId": device_info.get("uuid") or session_id  # Use device's deviceId as sessionId
+            }]
+
+            print(f"# [API Request] Endpoint: {DEVICE_INFO_ENDPOINT}", file=sys.stderr)
+            print(f"# [API Request] Full Payload:", file=sys.stderr)
+            print(f"# {json.dumps(api_payload, ensure_ascii=False, indent=2)}", file=sys.stderr)
+
+            response = requests.post(
+                DEVICE_INFO_ENDPOINT,
+                json=api_payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30
+            )
+            response.raise_for_status()
+            api_response = response.json()
+
+            print(f"# [API Response] Status Code: {response.status_code}", file=sys.stderr)
+            print(f"# [API Response] Full Body:", file=sys.stderr)
+            print(f"# {json.dumps(api_response, ensure_ascii=False, indent=2)}", file=sys.stderr)
+
+            # Extract echo outputs from API response
+            # Response structure: {"code": 0, "message": "OK", "data": [{"echo": {"cmd1": "output1"}, ...}]}
             api_responses = []
             all_outputs = []
-            
-            # The API returns data array with results for each command
+
             data_results = api_response.get("data", [])
-            
             for i, cmd in enumerate(commands):
+                cmd_str = cmd.strip()
+                echo_output = ""
+
+                # Try to find the echo for this command in the response
                 if i < len(data_results):
-                    # Create a single-command response structure for compatibility
-                    single_response = {
-                        "code": api_response.get("code", 0),
-                        "message": api_response.get("message", "Success"),
-                        "data": [data_results[i]]
-                    }
-                    command_output = extract_command_output(single_response)
-                else:
-                    command_output = ""
-                
+                    data_item = data_results[i]
+                    echo_data = data_item.get("echo", {})
+                    if isinstance(echo_data, dict):
+                        # echo is a dict like {"command": "output"}
+                        for echo_cmd, echo_output in echo_data.items():
+                            if echo_cmd.strip() == cmd_str or echo_cmd.strip() in cmd_str:
+                                break
+                    elif isinstance(echo_data, str):
+                        echo_output = echo_data
+
                 api_responses.append({
                     "command": cmd,
-                    "output": command_output,
+                    "output": echo_output,
                     "raw_response": api_response
                 })
-                all_outputs.append(command_output)
-                
-                print(f"# Command {i+1} output length: {len(command_output)} chars", file=sys.stderr)
-            
+                all_outputs.append(echo_output)
+                print(f"# Command {i+1} output length: {len(echo_output)} chars", file=sys.stderr)
+
             # Step 3: Combine outputs for analysis
             combined_output = "\n\n".join(all_outputs)
-            
+            print(f"# Combined output length: {len(combined_output)} chars", file=sys.stderr)
+
             # Step 4: Analyze results
             if effective_analysis_type not in ANALYSIS_HANDLERS:
                 print(json.dumps({"error": f"Unknown analysis_type: {effective_analysis_type}. Valid types: {list(ANALYSIS_HANDLERS.keys())}"}))
                 sys.exit(1)
-            
+
             analyzer = ANALYSIS_HANDLERS[effective_analysis_type]
             analysis_result = analyzer(combined_output)
-            
-            # Step 5: Return analysis result
+
+            # Step 5: Return analysis result in stepContent format for frontend
             result = {
-                "answerType": "stepAnalysis",
+                "answerType": "stepContent",
                 "contextEnd": "false",
                 "contextId": params.get("context_id", ""),
                 "currentStep": analysis_result.get("step", 0),
-                "commands_executed": len(commands),
-                "analysis": analysis_result,
+                "message": analysis_result.get("message", ""),
                 "questionNo": params.get("question_no", ""),
                 "sessionId": session_id,
-                "debug": {
-                    "commands": [r["command"] for r in api_responses],
-                    "output_lengths": [len(r["output"]) for r in api_responses]
-                }
+                "nextStep": analysis_result.get("next_step", "")  # Add nextStep for agent to determine next step
             }
-            
+
             print(json.dumps(result, ensure_ascii=False))
-            
+
         except Exception as e:
             import traceback
             error_traceback = traceback.format_exc()
             print(f"# Error: {error_traceback}", file=sys.stderr)
-            
+
             error_result = {
                 "answerType": "stepError",
                 "contextEnd": "false",
@@ -707,24 +1002,66 @@ def main():
             sys.exit(1)
     
     elif mode == "analyze":
-        # Analyze response (for manual testing/debugging)
+        # Analyze response from frontend (Frontend Integration Mode)
         if len(sys.argv) < 3:
             print(json.dumps({"error": "Missing response data for analyze mode"}))
             sys.exit(1)
-        
+
         params = json.loads(sys.argv[2])
-        analysis_type = params.get("analysis_type", "")
-        response_data = params.get("response_data", "")
-        
+        console_cmd = params.get("consoleCmd", "")
+        current_step = params.get("currentStep", 1)
+        session_id = params.get("sessionId", "")
+        question_no = params.get("questionNo", "")
+        status = params.get("status", True)
+
+        # Parse consoleCmd - it's a JSON string containing {command: output} pairs
+        command_outputs = {}
+        if console_cmd:
+            try:
+                command_outputs = json.loads(console_cmd)
+            except json.JSONDecodeError as e:
+                print(json.dumps({"error": f"Failed to parse consoleCmd: {e}"}))
+                sys.exit(1)
+
+        # Determine analysis type from context_id or params
+        analysis_type = params.get("analysis_type", "check_route")
+
+        # Combine all command outputs
+        combined_output = ""
+        for cmd, output in command_outputs.items():
+            combined_output += f"\n# Command: {cmd}\n{output}\n"
+
+        print(f"# Analyzing {len(command_outputs)} command outputs", file=sys.stderr)
+        print(f"# Analysis type: {analysis_type}", file=sys.stderr)
+
         if analysis_type not in ANALYSIS_HANDLERS:
             print(json.dumps({"error": f"Unknown analysis_type: {analysis_type}"}))
             sys.exit(1)
-        
+
         # Analyze result
         analyzer = ANALYSIS_HANDLERS[analysis_type]
-        analysis_result = analyzer(response_data)
-        
-        print(json.dumps(analysis_result, ensure_ascii=False))
+        analysis_result = analyzer(combined_output)
+
+        # Update step number in analysis result
+        if "step" not in analysis_result:
+            analysis_result["step"] = current_step
+
+        result = {
+            "answerType": "stepAnalysis",
+            "contextEnd": "false",
+            "contextId": params.get("contextId", ""),
+            "currentStep": current_step,
+            "commands_executed": len(command_outputs),
+            "analysis": analysis_result,
+            "questionNo": question_no,
+            "sessionId": session_id,
+            "debug": {
+                "commands": list(command_outputs.keys()),
+                "status": status
+            }
+        }
+
+        print(json.dumps(result, ensure_ascii=False))
     
     else:
         print(json.dumps({"error": f"Unknown mode: {mode}. Use 'build_and_execute' or 'analyze'"}))

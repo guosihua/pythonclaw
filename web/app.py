@@ -103,7 +103,8 @@ def create_app(provider: LLMProvider | None, *, build_provider_fn=None) -> FastA
     # app.add_api_route("/api/files", _api_list_files, methods=["GET"])
     app.add_api_websocket_route("/ws/chat", _ws_chat)
     app.add_api_route("/chatbot/upload", _api_chatbot_upload, methods=["POST"])
-    app.add_api_route("/chatbot/dm/claw/stream", _sse_chat, methods=["POST"])
+    app.add_api_route("/dm/cancas/chat", _sse_chat, methods=["POST"])
+    # app.add_api_route("/chatbot/dm/claw/stream", _sse_chat, methods=["POST"])
 
     return app
 
@@ -985,38 +986,46 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
     # Debug: log the input text
     logger.info("[StepMarker] Processing text: %s", repr(text[:200]))
     
-    # Check if text is a JSON stepCommand from tool execution
+    # Check if text contains STEP_RESULT markers
+    step_result_pattern = r'\[STEP_RESULT\](.*?)\[STEP_RESULT_END\]'
+    step_result_match = re.search(step_result_pattern, text, re.DOTALL)
+    if step_result_match:
+        json_content = step_result_match.group(1).strip()
+        logger.info("[StepMarker] Detected STEP_RESULT marker, extracting JSON content")
+        text = json_content
+    
+    # Check if text is a JSON step message from tool execution
     try:
         if text.strip().startswith('{'):
             parsed = _json.loads(text)
-            if parsed.get("answerType") == "stepCommand":
-                logger.info("[StepMarker] Detected direct stepCommand JSON")
-                # Extract currentStep from the JSON if available
-                current_step = parsed.get("currentStep", step_counter[0] + 1)
-                step_counter[0] = current_step
+            answer_type = parsed.get("answerType")
+            
+            # Handle stepCommand, stepContent, and conversation messages directly
+            if answer_type in ("stepCommand", "stepContent", "conversation"):
+                logger.info("[StepMarker] Detected direct %s JSON", answer_type)
                 
-                # Extract the actual message data (device commands) from the parsed JSON
-                message_data = parsed.get("message", {})
-                
-                # Build the complete stepCommand response with proper structure
-                conversation_id = contextId or str(int(time.time() * 1000))
-                step_command_data = {
-                    "answerType": "stepCommand",
-                    "contextEnd": "false",
-                    "contextId": conversation_id,
-                    "currentStep": current_step,
-                    "message": message_data,
-                    "questionNo": questionNo or "",
-                    "sessionId": sessionId
+                # Build the response by copying the parsed JSON and filling in missing fields
+                response_data = {
+                    "answerType": answer_type,
+                    "contextEnd": parsed.get("contextEnd", "false"),
+                    "contextId": parsed.get("contextId", contextId or str(int(time.time() * 1000))),
+                    "currentStep": parsed.get("currentStep", step_counter[0] + 1),
+                    "message": parsed.get("message", ""),
+                    "questionNo": parsed.get("questionNo", questionNo or ""),
+                    "sessionId": parsed.get("sessionId", sessionId)
                 }
                 
+                # Update step counter
+                step_counter[0] = response_data["currentStep"]
+                
                 # Serialize the complete structure as SSE message
-                sse_message = f"data: {_json.dumps(step_command_data, ensure_ascii=False)}\n\n"
+                sse_message = f"data: {_json.dumps(response_data, ensure_ascii=False)}\n\n"
                 messages.append(sse_message)
                 
-                logger.info("[StepMarker] Sending stepCommand for step %d", current_step)
+                logger.info("[StepMarker] Sending %s for step %d", answer_type, response_data["currentStep"])
                 return messages
-    except (_json.JSONDecodeError, Exception):
+    except (_json.JSONDecodeError, Exception) as e:
+        logger.info("[StepMarker] Not a valid JSON: %s", str(e))
         pass  # Not a JSON, continue with normal processing
     
     # Pattern to match [STEP_START]content[STEP_END]
@@ -1237,44 +1246,145 @@ async def _sse_chat(request: Request):
 
 async def _api_step_analyze(request: Request):
     """Analyze device response data using skill step scripts.
-    
+
     This endpoint receives device response data and calls the appropriate
     Python script to analyze it and determine the next troubleshooting step.
-    
-    Expected JSON body:
+
+    Expected JSON body (Frontend Integration Format):
     {
-        "script_name": "step1_check_route.py",
-        "response_data": "<raw device response>",
-        "session_id": "optional session identifier"
+        "script_name": "step_executor.py",
+        "sessionId": "session_xxx",
+        "consoleCmd": "{\"command\": \"output\"}",
+        "questionNo": "question_xxx",
+        "status": true,
+        "currentStep": 2,
+        "uuid": "device_uuid"
     }
-    
+
+    Or legacy format:
+    {
+        "script_name": "step_executor.py",
+        "response_data": "<raw device response>",
+        "session_id": "session_xxx",
+        "analysis_type": "check_route"
+    }
+
     Returns analysis result with decision logic for the next step.
     """
     import subprocess
     import sys
-    
+
     try:
         body = await request.json()
+
+        # Support frontend integration format
+        console_cmd = body.get("consoleCmd")
+        if console_cmd:
+            # Frontend integration format
+            script_name = body.get("script_name", "step_executor.py").strip()
+            session_id = body.get("sessionId", "")
+            current_step = body.get("currentStep", 1)
+            question_no = body.get("questionNo", "")
+            status = body.get("status", True)
+
+            # Parse consoleCmd - it's a JSON string containing {command: output} pairs
+            command_outputs = {}
+            if console_cmd:
+                try:
+                    command_outputs = json.loads(console_cmd)
+                except json.JSONDecodeError as e:
+                    return JSONResponse(
+                        {"ok": False, "error": f"Failed to parse consoleCmd: {e}"},
+                        status_code=400
+                    )
+
+            # Combine outputs
+            combined_output = ""
+            for cmd, output in command_outputs.items():
+                combined_output += f"\n# Command: {cmd}\n{output}\n"
+
+            # Prepare params for step_executor.py analyze mode
+            params = {
+                "analysis_type": body.get("analysis_type", "check_route"),
+                "response_data": combined_output,
+                "session_id": session_id,
+                "current_step": current_step,
+                "question_no": question_no,
+                "status": status,
+                "consoleCmd": console_cmd
+            }
+
+            # Find step_executor.py in skill directories
+            skill_base = Path(__file__).parent.parent / "templates" / "skills"
+            script_path = None
+
+            for category_dir in skill_base.iterdir():
+                if category_dir.is_dir():
+                    for skill_dir in category_dir.iterdir():
+                        if skill_dir.is_dir():
+                            candidate = skill_dir / script_name
+                            if candidate.exists():
+                                script_path = candidate
+                                break
+                    if script_path:
+                        break
+
+            if not script_path:
+                return JSONResponse(
+                    {"ok": False, "error": f"Script '{script_name}' not found"},
+                    status_code=404
+                )
+
+            # Execute the script in analyze mode with JSON params
+            cmd = [sys.executable, str(script_path), "analyze", json.dumps(params)]
+            logger.info("[StepAnalyze] Running: %s", " ".join(cmd))
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                logger.error("[StepAnalyze] Script failed: %s", error_msg)
+                return JSONResponse(
+                    {"ok": False, "error": f"Analysis failed: {error_msg}"},
+                    status_code=500
+                )
+
+            output = result.stdout.strip()
+            logger.info("[StepAnalyze] Analysis result: %s", output[:200])
+
+            # Parse and return the result
+            try:
+                analysis_result = json.loads(output)
+                return JSONResponse(analysis_result)
+            except json.JSONDecodeError:
+                return JSONResponse({"ok": True, "result": output})
+
+        # Legacy format support
         script_name = body.get("script_name", "").strip()
         response_data = body.get("response_data", "")
         session_id = body.get("session_id", "")
-        
+
         if not script_name:
             return JSONResponse(
                 {"ok": False, "error": "script_name is required"},
                 status_code=400
             )
-        
+
         if not response_data:
             return JSONResponse(
                 {"ok": False, "error": "response_data is required"},
                 status_code=400
             )
-        
+
         # Find the script in skill directories
         skill_base = Path(__file__).parent.parent / "templates" / "skills"
         script_path = None
-        
+
         for category_dir in skill_base.iterdir():
             if category_dir.is_dir():
                 for skill_dir in category_dir.iterdir():
@@ -1285,24 +1395,24 @@ async def _api_step_analyze(request: Request):
                             break
                 if script_path:
                     break
-        
+
         if not script_path:
             return JSONResponse(
                 {"ok": False, "error": f"Script '{script_name}' not found"},
                 status_code=404
             )
-        
+
         # Execute the script in analyze mode
         cmd = [sys.executable, str(script_path), "analyze", response_data]
         logger.info("[StepAnalyze] Running: %s", " ".join(cmd))
-        
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=30
         )
-        
+
         if result.returncode != 0:
             error_msg = result.stderr.strip() if result.stderr else "Unknown error"
             logger.error("[StepAnalyze] Script failed: %s", error_msg)
@@ -1310,10 +1420,10 @@ async def _api_step_analyze(request: Request):
                 {"ok": False, "error": f"Analysis failed: {error_msg}"},
                 status_code=500
             )
-        
+
         output = result.stdout.strip()
         logger.info("[StepAnalyze] Analysis result: %s", output[:200])
-        
+
         # Parse and return the result
         try:
             analysis_result = json.loads(output)

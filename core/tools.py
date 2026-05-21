@@ -309,13 +309,18 @@ def execute_step_script(script_name: str, mode: str, params: dict | str) -> str:
             env=_venv_env()
         )
         
+        # Log stderr (debug output from step_executor)
+        if result.stderr:
+            logger.info("[execute_step_script] Script stderr:\n%s", result.stderr)
+        
         if result.returncode != 0:
             error_msg = result.stderr.strip() if result.stderr else "Unknown error"
             logger.error("[execute_step_script] Script failed: %s", error_msg)
             return json.dumps({"error": f"Script execution failed: {error_msg}"})
         
         output = result.stdout.strip()
-        logger.info("[execute_step_script] Script output: %s", output[:200])
+        logger.info("[execute_step_script] Script output length: %d chars", len(output))
+        logger.info("[execute_step_script] Script output:\n%s", output)
         
         # Validate that output is valid JSON
         try:
