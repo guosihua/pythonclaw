@@ -310,6 +310,7 @@ class Agent:
         self._current_skill_step_commands: dict[int, list[str]] = {}  # Store commands for each step from SKILL.md (key: step_number)
         self._session_device_info: dict[str, dict] = {}  # Cache device_info per session for reuse across steps
         self._session_destination_network: dict[str, str] = {}  # Cache destination_network per session for reuse across steps
+        self._session_topology_fetched: set[str] = set()  # Track which sessions already fetched topology (step 0)
         self.MAX_PARALLEL_SKILLS = config.get_int(
             "agent", "maxParallelSkills", default=5,
         )
@@ -833,6 +834,73 @@ Don't repeat this if `bot_name` already exists in memory.
             except PackageNotFoundError:
                 missing.append(pkg)
         return missing
+
+    def _fetch_and_emit_topology(
+        self,
+        session_id: str,
+        context_id: str,
+        question_no: str,
+        on_token,
+    ) -> bool:
+        """Step 0: 获取网络拓扑图并按需求顺序通过 on_token 推送三条消息到前端。
+
+        前端约定的发送顺序：
+            1. {"answerType": "conversation", "message": "网络拓扑图获取中...<br/>"}
+            2. {"answerType": "topology", "message": {"nodes": [...], "edges": [...]}}
+            3. {"answerType": "conversation", "message": "获取成功"}
+
+        采用 session-level 去重，同一会话只会执行一次。
+        """
+        if not on_token:
+            # logger.info("[Topology] on_token not available, skip topology emission")
+            return False
+
+        cache_key = session_id or "default"
+        if cache_key in self._session_topology_fetched:
+            # logger.info(f"[Topology] Session {cache_key} already fetched topology, skip")
+            return False
+
+        try:
+            from .tools import execute_topology_script
+
+            topology_params = {
+                "session_id": session_id or "",
+                "context_id": context_id or "",
+                "question_no": question_no or "",
+            }
+            # logger.info(f"[Topology] Fetching topology with params: {topology_params}")
+            raw = execute_topology_script(topology_params)
+            # logger.info(f"[Topology] Raw topology bundle (length={len(raw) if raw else 0})")
+            # logger.info(f"[Topology] Raw topology bundle content:\n{raw}")
+
+            bundle = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            messages = bundle.get("messages") or []
+
+            if not messages:
+                # logger.warning("[Topology] No frontend messages in bundle, skipping")
+                # 仍然标记完成，避免反复尝试
+                self._session_topology_fetched.add(cache_key)
+                return False
+
+            for idx, msg in enumerate(messages):
+                try:
+                    serialized = json.dumps(msg, ensure_ascii=False)
+                    # logger.info(
+                    #     f"[Topology] Emitting message {idx + 1}/{len(messages)} (answerType={msg.get('answerType')})"
+                    # )
+                    on_token(serialized)
+                except Exception as emit_err:
+                    # 保留错误日志，便于排查发送失败
+                    logger.warning(f"[Topology] Failed to emit message {idx + 1}: {emit_err}")
+
+            self._session_topology_fetched.add(cache_key)
+            return True
+        except Exception as e:
+            # 保留异常日志，便于排查拓扑获取失败
+            logger.exception(f"[Topology] Failed to fetch/emit topology: {e}")
+            # 标记完成避免阻塞，让后续步骤继续执行
+            self._session_topology_fetched.add(cache_key)
+            return False
 
     def _extract_step_commands_from_skill(self, instructions: str, step_name_to_number: dict[str, int]) -> dict[int, list[str]]:
         """
@@ -1678,9 +1746,9 @@ Don't repeat this if `bot_name` already exists in memory.
                                 "commands": skill_commands,
                                 "destination_network": destination_network,
                                 "device_info": device_info,
-                                "context_id": skill_args.get("context_id", ""),
-                                "question_no": skill_args.get("question_no", ""),
-                                "session_id": self.session_id or "default"
+                                "context_id": getattr(self, "frontend_context_id", None) or skill_args.get("context_id", ""),
+                                "question_no": getattr(self, "frontend_question_no", None) or skill_args.get("question_no", ""),
+                                "session_id": getattr(self, "frontend_session_id", None) or self.session_id or "default"
                             }
                             
                             # Create next step tool call
@@ -1906,6 +1974,25 @@ Don't repeat this if `bot_name` already exists in memory.
                                     
                                     first_step_name = self._current_skill_steps[0]
                                     
+                                    # ── Step 0: 获取网络拓扑图 ──────────────────────
+                                    # 在执行第一步排查脚本之前，先调用第三方拓扑接口
+                                    # 并按约定顺序向前端发送三条 SSE 消息
+                                    try:
+                                        skill_args_for_topo = json.loads(forced_tool_call.function.arguments) if isinstance(forced_tool_call.function.arguments, str) else (forced_tool_call.function.arguments or {})
+                                    except Exception:
+                                        skill_args_for_topo = {}
+                                    # 优先使用 web 层注入的前端上下文（contextId/questionNo/sessionId），
+                                    # 这样发给前端的 SSE 消息能与前端原始请求匹配上
+                                    topo_session_id = getattr(self, "frontend_session_id", None) or self.session_id or "default"
+                                    topo_context_id = getattr(self, "frontend_context_id", None) or skill_args_for_topo.get("context_id", "")
+                                    topo_question_no = getattr(self, "frontend_question_no", None) or skill_args_for_topo.get("question_no", "")
+                                    self._fetch_and_emit_topology(
+                                        session_id=topo_session_id,
+                                        context_id=topo_context_id,
+                                        question_no=topo_question_no,
+                                        on_token=on_token,
+                                    )
+                                    
                                     # If we already have a step result from forced tool call (is_step_result),
                                     # skip re-executing the first step to avoid duplicate execution
                                     if is_step_result:
@@ -1984,9 +2071,10 @@ Don't repeat this if `bot_name` already exists in memory.
                                             "commands": skill_commands,
                                             "destination_network": destination_network,
                                             "device_info": device_info,
-                                            "context_id": skill_args.get("context_id", ""),
-                                            "question_no": skill_args.get("question_no", ""),
-                                            "session_id": self.session_id or "default"
+                                            # 优先使用 web 层注入的前端上下文，避免后端自造的 contextId/questionNo
+                                            "context_id": getattr(self, "frontend_context_id", None) or skill_args.get("context_id", ""),
+                                            "question_no": getattr(self, "frontend_question_no", None) or skill_args.get("question_no", ""),
+                                            "session_id": getattr(self, "frontend_session_id", None) or self.session_id or "default"
                                         }
                                         logger.info(f"[Agent] Step params built successfully")
                                         
@@ -2256,9 +2344,9 @@ Don't repeat this if `bot_name` already exists in memory.
                                                 "commands": skill_commands,
                                                 "destination_network": destination_network,
                                                 "device_info": device_info,
-                                                "context_id": skill_args.get("context_id", ""),
-                                                "question_no": skill_args.get("question_no", ""),
-                                                "session_id": self.session_id or "default"
+                                                "context_id": getattr(self, "frontend_context_id", None) or skill_args.get("context_id", ""),
+                                                "question_no": getattr(self, "frontend_question_no", None) or skill_args.get("question_no", ""),
+                                                "session_id": getattr(self, "frontend_session_id", None) or self.session_id or "default"
                                             }
                                             
                                             # Create next step tool call

@@ -336,6 +336,106 @@ def execute_step_script(script_name: str, mode: str, params: dict | str) -> str:
         return json.dumps({"error": f"Unexpected error: {str(exc)}"})
 
 
+def execute_topology_script(params: dict | str | None = None) -> str:
+    """Fetch the network topology for the active skill and return a JSON bundle
+    of frontend-bound messages.
+
+    This runs ``topology_executor.py`` in the static-troubleshooting skill
+    directory, which:
+      1. Loads file/devices.json
+      2. Calls the third-party topology API
+      3. Builds three SSE-ready messages: opening conversation,
+         topology data, closing conversation.
+
+    Parameters
+    ----------
+    params : dict | str | None
+        Optional dict containing ``session_id``, ``context_id``,
+        ``question_no``. Strings are auto-parsed as JSON.
+
+    Returns
+    -------
+    str
+        JSON string with structure::
+
+            {
+              "answerType": "topologyBundle",
+              "status": "success" | "failed",
+              "sessionId": "...",
+              "contextId": "...",
+              "questionNo": "...",
+              "currentStep": 0,
+              "messages": [ ...three SSE-ready dicts... ]
+            }
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    try:
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except json.JSONDecodeError:
+                return json.dumps({"error": f"Invalid JSON in params: {params}"})
+        if params is None:
+            params = {}
+
+        skill_base = Path(__file__).parent.parent / "templates" / "skills"
+        script_path = None
+        for category_dir in skill_base.iterdir():
+            if not category_dir.is_dir():
+                continue
+            for skill_dir in category_dir.iterdir():
+                if skill_dir.is_dir():
+                    candidate = skill_dir / "topology_executor.py"
+                    if candidate.exists():
+                        script_path = candidate
+                        break
+            if script_path:
+                break
+
+        if not script_path:
+            return json.dumps({"error": "topology_executor.py not found in any skill directory"})
+
+        cmd = [sys.executable, str(script_path), "fetch", json.dumps(params)]
+        # logger.info("[execute_topology_script] Running: %s", " ".join(cmd))
+        # 拓扑获取耗时较长（第三方接口 read timeout 已设为 120s），
+        # 子进程额外预留 30s 用于设备列表加载与日志输出，整体 150s
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=150,
+            env=_venv_env(),
+        )
+
+        if result.stderr:
+            # logger.info("[execute_topology_script] Script stderr:\n%s", result.stderr)
+            pass
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            logger.error("[execute_topology_script] Script failed: %s", error_msg)
+            return json.dumps({"error": f"Topology script execution failed: {error_msg}"})
+
+        output = result.stdout.strip()
+        # logger.info("[execute_topology_script] Script output length: %d chars", len(output))
+        # logger.info("[execute_topology_script] Script output:\n%s", output)
+
+        try:
+            json.loads(output)
+            return output
+        except json.JSONDecodeError:
+            return json.dumps({"error": f"Topology script returned invalid JSON: {output[:200]}"})
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Topology script execution timed out (150s limit)"})
+    except Exception as exc:
+        logger.exception("[execute_topology_script] Unexpected error")
+        return json.dumps({"error": f"Unexpected error: {str(exc)}"})
+
+
 
 # ============================================================================
 # Tool Schemas and Registry
@@ -588,6 +688,35 @@ EXECUTE_STEP_TOOL: list[dict] = [
 ]
 
 
+EXECUTE_TOPOLOGY_TOOL: list[dict] = [
+    _fn(
+        "execute_topology_script",
+        "Fetch network topology for the active skill. Returns a JSON bundle of frontend-bound messages including topology data. Should be called once at the very beginning of the troubleshooting flow before executing the first step.",
+        {
+            "params": {
+                "type": "object",
+                "description": "Optional parameters for the topology script.",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Unique session ID."
+                    },
+                    "context_id": {
+                        "type": "string",
+                        "description": "Context ID for linking with frontend UI."
+                    },
+                    "question_no": {
+                        "type": "string",
+                        "description": "Question number for tracking multiple troubleshooting sessions."
+                    }
+                },
+            },
+        },
+        [],
+    ),
+]
+
+
 # Unified tool registry — Agent._build_tools() picks subsets at runtime.
 AVAILABLE_TOOLS: dict[str, callable] = {
     "run_command": lambda **kwargs: None,  # Placeholder; actual impl injected by Agent
@@ -609,4 +738,5 @@ AVAILABLE_TOOLS: dict[str, callable] = {
     "web_search": lambda **kwargs: None,
     "consult_knowledge_base": lambda **kwargs: None,
     "execute_step_script": execute_step_script,
+    "execute_topology_script": execute_topology_script,
 }

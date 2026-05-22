@@ -1000,8 +1000,8 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
             parsed = _json.loads(text)
             answer_type = parsed.get("answerType")
             
-            # Handle stepCommand, stepContent, and conversation messages directly
-            if answer_type in ("stepCommand", "stepContent", "conversation"):
+            # Handle stepCommand, stepContent, conversation, and topology messages directly
+            if answer_type in ("stepCommand", "stepContent", "conversation", "topology"):
                 logger.info("[StepMarker] Detected direct %s JSON", answer_type)
                 
                 # Build the response by copying the parsed JSON and filling in missing fields
@@ -1015,8 +1015,13 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
                     "sessionId": parsed.get("sessionId", sessionId)
                 }
                 
-                # Update step counter
-                step_counter[0] = response_data["currentStep"]
+                # Update step counter (但 topology / conversation 的 currentStep=0 不应推进 step_counter)
+                try:
+                    cs_val = int(response_data["currentStep"])
+                except (TypeError, ValueError):
+                    cs_val = step_counter[0]
+                if cs_val > step_counter[0]:
+                    step_counter[0] = cs_val
                 
                 # Serialize the complete structure as SSE message
                 sse_message = f"data: {_json.dumps(response_data, ensure_ascii=False)}\n\n"
@@ -1138,6 +1143,9 @@ async def _sse_chat(request: Request):
         sessionId = payload.get("sessionId", "").strip()
         if not sessionId:
             sessionId = str(uuid.uuid4()).upper()
+        # 前端会传 contextId（必填）和可选 fileId，需要透传到 SSE 上下文
+        client_context_id = (payload.get("contextId") or "").strip()
+        client_file_id = (payload.get("fileId") or "").strip()
         image_data = payload.get("image")
     except Exception:
         return JSONResponse(
@@ -1183,10 +1191,24 @@ async def _sse_chat(request: Request):
         loop = asyncio.get_event_loop()
         sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
         
-        # Generate context ID for this conversation
-        context_id = str(uuid.uuid4())
-        question_no = f"session_{int(time.time() * 1000)}"
+        # 优先使用前端传入的 contextId；缺失时才回退到自动生成
+        context_id = client_context_id or str(uuid.uuid4())
+        # 按前端约定生成 questionNo，格式：<sessionId><时间戳>
+        question_no = f"{sessionId}{int(time.time() * 1000)}"
         step_counter = [0]  # Mutable list to track step count
+        logger.info(
+            "[SSE] Conversation context bound: sessionId=%s, contextId=%s (from_client=%s), questionNo=%s",
+            sessionId, context_id, bool(client_context_id), question_no,
+        )
+        # 把上下文信息注入 agent，供后端自动触发的步骤/拓扑工具使用
+        try:
+            if agent is not None:
+                agent.frontend_context_id = context_id
+                agent.frontend_question_no = question_no
+                agent.frontend_session_id = sessionId
+                agent.frontend_file_id = client_file_id
+        except Exception as bind_err:
+            logger.warning("[SSE] Failed to bind frontend context to agent: %s", bind_err)
 
         def _on_token(text: str) -> None:
             # Process step markers and send appropriate messages
