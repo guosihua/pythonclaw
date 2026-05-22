@@ -984,7 +984,7 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
     messages = []
     
     # Debug: log the input text
-    logger.info("[StepMarker] Processing text: %s", repr(text[:200]))
+    logger.info("[StepMarker] Processing text: %s", repr(text))
     
     # Check if text contains STEP_RESULT markers
     step_result_pattern = r'\[STEP_RESULT\](.*?)\[STEP_RESULT_END\]'
@@ -1040,7 +1040,7 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
         if match.start() > last_end:
             normal_text = text[last_end:match.start()]
             if normal_text.strip():
-                logger.info("[StepMarker] Sending normal text: %s", repr(normal_text[:100]))
+                logger.info("[StepMarker] Sending normal text: %s", repr(normal_text))
                 messages.append(build_response(sessionId, normal_text, False, 'AI_LIST', contextId))
         
         # Increment step counter and send step notification
@@ -1063,7 +1063,7 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
     if last_end < len(text):
         remaining_text = text[last_end:]
         if remaining_text.strip():
-            logger.info("[StepMarker] Sending remaining text: %s", repr(remaining_text[:100]))
+            logger.info("[StepMarker] Sending remaining text: %s", repr(remaining_text))
             messages.append(build_response(sessionId, remaining_text, False, 'AI_LIST', contextId))
     
     if not messages:
@@ -1133,8 +1133,8 @@ async def _sse_chat(request: Request):
     
     try:
         payload = await request.json()
-        message = payload.get("content", "").strip()
-        userId = payload.get("userId", "").strip()
+        message = payload.get("question", "").strip() or payload.get("content", "").strip()
+        userId = str(payload.get("userId", "")).strip()
         sessionId = payload.get("sessionId", "").strip()
         if not sessionId:
             sessionId = str(uuid.uuid4()).upper()
@@ -1190,11 +1190,11 @@ async def _sse_chat(request: Request):
 
         def _on_token(text: str) -> None:
             # Process step markers and send appropriate messages
-            logger.info("[SSE] _on_token called with text length: %d, preview: %s", len(text), repr(text[:100]))
+            logger.info("[SSE] _on_token called with text length: %d, preview: %s", len(text), repr(text))
             messages = process_step_markers(sessionId, text, context_id, question_no, step_counter)
             logger.info("[SSE] process_step_markers returned %d messages", len(messages))
             for i, msg in enumerate(messages):
-                logger.info("[SSE] Sending message %d: %s", i+1, repr(msg[:150]))
+                logger.info("[SSE] Sending message %d: %s", i+1, repr(msg))
                 loop.call_soon_threadsafe(sse_queue.put_nowait, msg)
 
         chat_input: str | list = message or ""
@@ -1219,7 +1219,7 @@ async def _sse_chat(request: Request):
                     logger.info("[SSE] Received None from queue, breaking loop after %d messages", message_count)
                     break
                 message_count += 1
-                logger.info("[SSE] Yielding message %d to client: %s", message_count, repr(sse_chunk[:150]))
+                logger.info("[SSE] Yielding message %d to client: %s", message_count, repr(sse_chunk))
                 yield sse_chunk
             logger.info("[SSE] Total messages sent: %d", message_count)
         except Exception as exc:

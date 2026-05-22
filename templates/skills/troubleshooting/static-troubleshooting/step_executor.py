@@ -397,35 +397,6 @@ def build_commands_from_templates(templates: List[str], params: Dict[str, Any]) 
 
 
 # ============================================================================
-# Step Command Templates
-# ============================================================================
-
-STEP_COMMAND_TEMPLATES = {
-    "check_route": [
-        "display ip routing-table {{destination_network}}"
-    ],
-    "check_nexthop": [
-        "display ip routing-table protocol static {{destination_network}}",
-        "ping {{nexthop_ip}}"
-    ],
-    "check_mask": [
-        "display ip routing-table"
-    ],
-    "check_interface": [
-        "display interface brief"
-    ],
-    "check_bfd": [
-        "display bfd session",
-        "display track all"
-    ],
-    "check_priority": [
-        "display ip routing-table",
-        "display ip routing-table verbose"
-    ]
-}
-
-
-# ============================================================================
 # Step Type Handlers - Result Analyzers (Keep these for analysis logic)
 # ============================================================================
 
@@ -473,27 +444,81 @@ def analyze_check_route_result(response_data: str) -> Dict[str, Any]:
 
 
 def analyze_check_nexthop_result(response_data: str) -> Dict[str, Any]:
-    """Analyze ping response for next-hop reachability."""
+    """Analyze ping response for next-hop reachability.
+    
+    支持 H3C 设备 ping 回显格式，例如：
+        --- Ping statistics for 127.0.0.1 ---
+        5 packet(s) transmitted, 5 packet(s) received, 0.0% packet loss
+        round-trip min/avg/max/std-dev = 0.337/0.430/0.639/0.107 ms
+    """
     result = {
         "step": 2,
         "step_name": "检查下一跳地址可达性",
         "status": "",
         "reachable": False,
-        "packet_loss": 0,
+        "packet_loss": 100.0,
         "next_step": "",
         "message": ""
     }
     
-    if "success" in response_data.lower() or "100%" in response_data:
-        result["reachable"] = True
-        result["status"] = "success"
-        result["next_step"] = "step3"
-        result["message"] = "下一跳地址可达，继续检查路由掩码与最长匹配原则"
-    elif "timeout" in response_data.lower() or "unreachable" in response_data.lower():
+    lower_data = response_data.lower()
+    
+    # 1. 优先解析 H3C 格式的丢包率: "X.X% packet loss"
+    loss_match = re.search(r'([\d.]+)\s*%\s*packet\s*loss', lower_data)
+    
+    # 2. 也支持 transmitted/received 形式: "5 packet(s) transmitted, 5 packet(s) received"
+    tx_rx_match = re.search(r'(\d+)\s*packet\(s\)\s*transmitted[^\d]+(\d+)\s*packet\(s\)\s*received', lower_data)
+    
+    # 3. 兼容旧格式 "Success rate is X%"
+    success_rate_match = re.search(r'success\s*rate\s*is\s*([\d.]+)\s*%', lower_data)
+    
+    packet_loss = None
+    if loss_match:
+        try:
+            packet_loss = float(loss_match.group(1))
+        except (TypeError, ValueError):
+            packet_loss = None
+    elif tx_rx_match:
+        try:
+            tx = int(tx_rx_match.group(1))
+            rx = int(tx_rx_match.group(2))
+            if tx > 0:
+                packet_loss = (tx - rx) / tx * 100.0
+        except (TypeError, ValueError):
+            packet_loss = None
+    elif success_rate_match:
+        try:
+            sr = float(success_rate_match.group(1))
+            packet_loss = 100.0 - sr
+        except (TypeError, ValueError):
+            packet_loss = None
+    
+    if packet_loss is not None:
+        result["packet_loss"] = packet_loss
+        if packet_loss < 100.0:
+            result["reachable"] = True
+            result["status"] = "success"
+            result["next_step"] = "step3"
+            if packet_loss == 0.0:
+                result["message"] = "下一跳地址可达（丢包率0%），继续检查路由掩码与最长匹配原则"
+            else:
+                result["message"] = f"下一跳地址部分可达（丢包率{packet_loss:.1f}%），继续检查路由掩码与最长匹配原则"
+        else:
+            result["reachable"] = False
+            result["status"] = "unreachable"
+            result["next_step"] = "step7"
+            result["message"] = "下一跳地址不可达（丢包率100%），需要排查链路问题"
+    elif "timeout" in lower_data or "unreachable" in lower_data or "request time out" in lower_data:
         result["reachable"] = False
         result["status"] = "unreachable"
         result["next_step"] = "step7"
         result["message"] = "下一跳地址不可达，需要排查链路问题"
+    elif "100%" in response_data or "success" in lower_data:
+        # 旧版兼容：当回显中包含 100% 但未匹配到丢包率时，认为成功
+        result["reachable"] = True
+        result["status"] = "success"
+        result["next_step"] = "step3"
+        result["message"] = "下一跳地址可达，继续检查路由掩码与最长匹配原则"
     else:
         result["status"] = "error"
         result["next_step"] = "step7"
@@ -662,13 +687,10 @@ def main():
             session_id = f"troubleshooting-{uuid.uuid4().hex[:8]}"
             print(f"# Generated session_id: {session_id}", file=sys.stderr)
         
-        # Auto-generate commands if not provided
-        if not commands_templates and effective_analysis_type:
-            commands_templates = STEP_COMMAND_TEMPLATES.get(effective_analysis_type, [])
-        
+        # Commands must be provided from SKILL.md
         if not commands_templates:
             print(json.dumps({
-                "error": f"Cannot determine commands. Please provide 'commands' field or set 'analysis_type'/'step_type' to one of: {list(STEP_COMMAND_TEMPLATES.keys())}"
+                "error": "Cannot determine commands. Please provide 'commands' field from SKILL.md"
             }))
             sys.exit(1)
         
@@ -809,25 +831,19 @@ def main():
             if destination_network_empty:
                 missing_fields_display.append("目的网段")
             
-            user_message = f"需要补充以下信息以继续故障排查：{', '.join(missing_fields_display)}"
+            # Build message with clear format for regex extraction
+            user_message = "需要补充以下信息以继续故障排查：<br/>"
             if original_device_ip_empty:
-                user_message += "\n- 设备IP地址：例如 192.168.1.1"
+                user_message += "- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>"
             if destination_network_empty:
-                user_message += "\n- 目的网段：例如 192.168.1.0/24"
+                user_message += "- 目的IP网段：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.0）<br/>"
             
             result = {
-                "answerType": "stepInfoRequest",
+                "answerType": "conversation",
                 "contextEnd": "false",
                 "contextId": params.get("context_id", ""),
-                "currentStep": step_number,
-                "missing_fields": missing_fields,
+                "currentStep": params.get("step_number", 0),
                 "message": user_message,
-                "user_message": user_message,
-                "fields": info_fields,
-                "required_info": {
-                    "device_ip": "设备IP地址",
-                    "destination_network": "目的网段 (例如: 192.168.1.0/24)"
-                },
                 "questionNo": params.get("question_no", ""),
                 "sessionId": session_id
             }
@@ -843,8 +859,14 @@ def main():
         # For check_nexthop analysis type, we need to extract nexthop_ip from routing table first
         if effective_analysis_type == "check_nexthop" and "{{nexthop_ip}}" in str(commands):
             print(f"# [check_nexthop] Need to extract nexthop_ip first", file=sys.stderr)
-            # First, execute the first command (display ip routing-table protocol static {{destination_network}}) to get nexthop
-            route_cmd = commands[0]  # This should be the rendered command with destination_network
+            # Find the routing-table command (the one without nexthop_ip placeholder)
+            route_cmd = None
+            for c in commands:
+                if "routing-table" in c.lower() and "{{nexthop_ip}}" not in c:
+                    route_cmd = c
+                    break
+            if not route_cmd:
+                route_cmd = commands[0]
             print(f"# [check_nexthop] Executing route command to get nexthop: {route_cmd}", file=sys.stderr)
             
             # Build API request for route command
@@ -928,26 +950,56 @@ def main():
             print(f"# {json.dumps(api_response, ensure_ascii=False, indent=2)}", file=sys.stderr)
 
             # Extract echo outputs from API response
-            # Response structure: {"code": 0, "message": "OK", "data": [{"echo": {"cmd1": "output1"}, ...}]}
+            # Response structure: {"code": 0, "message": "OK", "data": [{"echo": {"cmd1": "output1", "cmd2": "output2"}, ...}]}
+            # Note: 实际场景中 data 数组可能只有 1 个元素，其 echo 字典包含所有命令的回显
             api_responses = []
             all_outputs = []
 
             data_results = api_response.get("data", [])
+            
+            # 先把所有 data_item 中的 echo 合并成一个统一的字典 {命令: 回显}
+            merged_echo_map: Dict[str, str] = {}
+            for data_item in data_results:
+                if not isinstance(data_item, dict):
+                    continue
+                echo_data = data_item.get("echo", {})
+                if isinstance(echo_data, dict):
+                    for echo_cmd, echo_text in echo_data.items():
+                        if isinstance(echo_cmd, str) and isinstance(echo_text, str):
+                            merged_echo_map[echo_cmd.strip()] = echo_text
+                elif isinstance(echo_data, str):
+                    # 兜底：echo 是单个字符串
+                    merged_echo_map.setdefault("_raw_", echo_data)
+            
+            print(f"# Merged echo keys: {list(merged_echo_map.keys())}", file=sys.stderr)
+            
+            # 按命令顺序匹配回显
             for i, cmd in enumerate(commands):
                 cmd_str = cmd.strip()
                 echo_output = ""
 
-                # Try to find the echo for this command in the response
-                if i < len(data_results):
+                # 1. 完全匹配
+                if cmd_str in merged_echo_map:
+                    echo_output = merged_echo_map[cmd_str]
+                else:
+                    # 2. 模糊匹配：echo_cmd 是 cmd_str 的子串（命令完整出现在回显 key 中）
+                    for echo_cmd, echo_text in merged_echo_map.items():
+                        if cmd_str == echo_cmd or cmd_str in echo_cmd or echo_cmd in cmd_str:
+                            echo_output = echo_text
+                            break
+                
+                # 3. 兜底：按索引取（适用于 echo 是 list 或 echo_cmd 都对不上的情况）
+                if not echo_output and i < len(data_results):
                     data_item = data_results[i]
-                    echo_data = data_item.get("echo", {})
-                    if isinstance(echo_data, dict):
-                        # echo is a dict like {"command": "output"}
-                        for echo_cmd, echo_output in echo_data.items():
-                            if echo_cmd.strip() == cmd_str or echo_cmd.strip() in cmd_str:
-                                break
-                    elif isinstance(echo_data, str):
-                        echo_output = echo_data
+                    if isinstance(data_item, dict):
+                        echo_data = data_item.get("echo", {})
+                        if isinstance(echo_data, str):
+                            echo_output = echo_data
+                        elif isinstance(echo_data, dict) and echo_data:
+                            # 取该 data_item 中索引位置对应的 echo 值
+                            echo_values = list(echo_data.values())
+                            if echo_values:
+                                echo_output = echo_values[0]
 
                 api_responses.append({
                     "command": cmd,
@@ -955,7 +1007,7 @@ def main():
                     "raw_response": api_response
                 })
                 all_outputs.append(echo_output)
-                print(f"# Command {i+1} output length: {len(echo_output)} chars", file=sys.stderr)
+                print(f"# Command {i+1} ({cmd_str}) output length: {len(echo_output)} chars", file=sys.stderr)
 
             # Step 3: Combine outputs for analysis
             combined_output = "\n\n".join(all_outputs)
