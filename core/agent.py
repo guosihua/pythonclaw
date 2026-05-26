@@ -902,6 +902,84 @@ Don't repeat this if `bot_name` already exists in memory.
             self._session_topology_fetched.add(cache_key)
             return False
 
+    def _override_currentstep(self, raw, forced_step):
+        """把 stepCommand/stepContent 等消息的 currentStep 字段强制改成
+        SKILL.md 解析得到的步骤号 forced_step，避免脚本侧硬编码 step 值
+        与 SKILL.md 不一致导致前端展示错位。
+
+        - raw 可以是 dict 或 JSON 字符串
+        - forced_step 为 None 时不做改写，直接返回字符串形式
+        - 返回值始终为 JSON 字符串，便于直接 on_token 发送
+        """
+        try:
+            if isinstance(raw, str):
+                obj = json.loads(raw)
+            elif isinstance(raw, dict):
+                obj = raw
+            else:
+                return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        except Exception:
+            return raw if isinstance(raw, str) else str(raw)
+
+        if forced_step is not None and isinstance(obj, dict):
+            try:
+                obj["currentStep"] = int(forced_step)
+            except Exception:
+                obj["currentStep"] = forced_step
+        return json.dumps(obj, ensure_ascii=False)
+
+    def _emit_step_bundle_if_present(self, raw_result, on_token, forced_step=None) -> tuple[bool, str]:
+        """检测 step_executor 返回的结果中是否带 stepBundle（含 stepCommand+stepContent
+        的复合包）。如果带：
+            - 把 stepBundle 中除最后一条以外的所有消息（通常是 stepCommand）
+              立即通过 on_token 推送给前端；
+            - 返回 (True, last_message_json) —— last_message_json 是 bundle
+              中最后一条消息（通常是 stepContent），由上层负责发送 step_marker
+              并 on_token 推送。
+        如果没带 stepBundle：返回 (False, original_result_str)。
+
+        这样既保证了 stepCommand 在 stepContent 之前到达前端（顺序固定），
+        又复用了原有的 stepContent 推进逻辑（answerType/nextStep 等）。
+        """
+        if raw_result is None:
+            return False, ""
+
+        result_str = raw_result if isinstance(raw_result, str) else str(raw_result)
+
+        try:
+            parsed = json.loads(result_str) if isinstance(result_str, str) else None
+        except Exception:
+            return False, result_str
+
+        if not isinstance(parsed, dict):
+            return False, result_str
+
+        bundle_messages = parsed.get("stepBundle")
+        if not isinstance(bundle_messages, list) or not bundle_messages:
+            return False, result_str
+
+        # 先推送除最后一条之外的所有 bundle 消息（stepCommand 等）
+        # 注意：这里不 sleep——stepCommand 和 stepContent 应当连续到达前端，
+        # 由上层调用方在 stepContent 推送之后统一 sleep 给打字机留时间。
+        if on_token:
+            for idx, msg in enumerate(bundle_messages[:-1]):
+                try:
+                    # 强制把 currentStep 改成 SKILL.md 的步骤号
+                    serialized = self._override_currentstep(msg, forced_step)
+                    logger.info(
+                        f"[StepBundle] Emitting bundle message {idx + 1}/{len(bundle_messages)} "
+                        f"(answerType={msg.get('answerType') if isinstance(msg, dict) else 'unknown'}, "
+                        f"forced_step={forced_step})"
+                    )
+                    on_token(serialized)
+                except Exception as emit_err:
+                    logger.warning(f"[StepBundle] Failed to emit bundle message {idx + 1}: {emit_err}")
+
+        # 最后一条交给调用方，仍按原 stepContent 流程发送（含 [STEP_START] 标记）
+        last_msg = bundle_messages[-1]
+        last_str = self._override_currentstep(last_msg, forced_step)
+        return True, last_str
+
     def _extract_step_commands_from_skill(self, instructions: str, step_name_to_number: dict[str, int]) -> dict[int, list[str]]:
         """
         Parse SKILL.md instructions and extract `commands` field from each step's
@@ -1617,14 +1695,45 @@ Don't repeat this if `bot_name` already exists in memory.
                             current_step_name = self._current_skill_steps[current_step_idx - 1]
                         else:
                             current_step_name = self._current_skill_steps[0] if self._current_skill_steps else ""
-                        
-                        # Send step marker and result to frontend
+
+                        # 统一从 SKILL.md 解析的 _current_skill_step_numbers 取真实步骤号
+                        # 该值是 stepName / stepCommand / stepContent 三条消息的唯一 currentStep 源
+                        _idx_for_num = current_step_idx - 1 if current_step_idx > 0 else 0
+                        if 0 <= _idx_for_num < len(self._current_skill_step_numbers):
+                            _skill_step_num = self._current_skill_step_numbers[_idx_for_num]
+                        else:
+                            _skill_step_num = self._current_skill_step_numbers[0] if self._current_skill_step_numbers else 1
+
+                        # 先把当前步骤名 [STEP_START]...[STEP_END] 推送给前端，
+                        # 让前端先切换到新 step（清空旧 step 残留的展示），然后
+                        # 再推送本步骤的 stepCommand / stepContent，保证它们都
+                        # 挂载到正确的 step 下。
                         if on_token:
-                            step_marker = f"[STEP_START]{current_step_name}[STEP_END]"
-                            logger.info(f"[SkillSteps] Sending step notification: {current_step_name}")
+                            step_marker = f"[STEP_START:{_skill_step_num}]{current_step_name}[STEP_END]"
+                            logger.info(f"[SkillSteps] Sending step notification: step={_skill_step_num} name={current_step_name}")
                             on_token(step_marker)
+
+                        # 如果 step_executor 返回了 stepBundle（含 stepCommand 回显
+                        # + stepContent 分析），先把 stepCommand 等附加消息推送给
+                        # 前端，再用最后一条 stepContent 字符串作为后续 result_str
+                        # forced_step 强制 stepCommand/stepContent 的 currentStep 与 SKILL.md 一致
+                        bundle_handled, result_str = self._emit_step_bundle_if_present(step_result, on_token, forced_step=_skill_step_num)
+                        if bundle_handled:
+                            logger.info("[Agent] stepBundle detected, stepCommand pushed before stepContent")
+
+                        # Send stepContent result to frontend (step_marker 已在上方发送)
+                        if on_token:
+                            # 兜底：再次确保 currentStep 与 SKILL.md 一致
+                            result_str = self._override_currentstep(result_str, _skill_step_num)
                             logger.info("[Agent] Sending stepContent to frontend")
                             on_token(result_str)
+                            # stepContent（总结信息）推送之后 sleep 3 秒，留出
+                            # 前端打字机动画时间
+                            try:
+                                import time as _time
+                                _time.sleep(3)
+                            except Exception:
+                                pass
                         
                         # Continue executing next steps based on nextStep field
                         from .llm.response import MockFunction, MockToolCall
@@ -1677,16 +1786,26 @@ Don't repeat this if `bot_name` already exists in memory.
                                 self._current_skill_steps = []
                                 self._current_skill_step_numbers = []
                                 self._session_step_indices.pop(session_id_for_step, None)
+                                summary_text = (
+                                    "静态路由故障排查完成。<br/><br/>"
+                                    "诊断结果：已完成所有故障排查步骤。<br/><br/>"
+                                    "建议：根据各步骤分析结果进行相应配置调整。<br/>"
+                                )
                                 completion_result = {
                                     "answerType": "conversation",
                                     "contextEnd": "false",
                                     "contextId": "",
                                     "currentStep": next_step_number,
-                                    "message": "静态路由故障排查完成。\n\n诊断结果：已完成所有故障排查步骤。\n\n建议：根据各步骤分析结果进行相应配置调整。",
+                                    "message": summary_text,
                                     "questionNo": "",
                                     "sessionId": self.session_id or "default"
                                 }
-                                return json.dumps(completion_result, ensure_ascii=False)
+                                completion_json = json.dumps(completion_result, ensure_ascii=False)
+                                # 推送一条 conversation 总结消息给前端
+                                if on_token:
+                                    logger.info("[Agent] Emitting final conversation summary to frontend")
+                                    on_token(completion_json)
+                                return completion_json
                             
                             # Build next step params
                             step_to_analysis_type = {
@@ -1782,12 +1901,29 @@ Don't repeat this if `bot_name` already exists in memory.
                                 if on_token:
                                     on_token(str(next_step_result))
                                 return str(next_step_result)
-                            
-                            # Send next step result to frontend
+
+                            # 先发送 [STEP_START]...[STEP_END] 切换前端到新 step
+                            # next_step_number 来自 _current_skill_step_numbers（SKILL.md）
                             if on_token:
-                                step_marker = f"[STEP_START]{next_step_name}[STEP_END]"
+                                step_marker = f"[STEP_START:{next_step_number}]{next_step_name}[STEP_END]"
                                 on_token(step_marker)
+
+                            # 若返回 stepBundle，先推送 stepCommand 等附加消息
+                            # forced_step 强制 stepCommand/stepContent 的 currentStep 与 SKILL.md 一致
+                            bundle_handled, next_step_result = self._emit_step_bundle_if_present(next_step_result, on_token, forced_step=next_step_number)
+                            if bundle_handled:
+                                logger.info("[Agent] stepBundle detected on next step, stepCommand pushed before stepContent")
+
+                            # Send next step stepContent to frontend (step_marker 已在上方发送)
+                            if on_token:
+                                # 兜底：再次确保 currentStep 与 SKILL.md 一致
+                                next_step_result = self._override_currentstep(next_step_result, next_step_number)
                                 on_token(str(next_step_result))
+                                try:
+                                    import time as _time
+                                    _time.sleep(3)
+                                except Exception:
+                                    pass
                             
                             # Update step index and continue
                             self._session_step_indices[session_id_for_step] = self._session_step_indices.get(session_id_for_step, 0) + 1
@@ -2137,24 +2273,44 @@ Don't repeat this if `bot_name` already exists in memory.
                                     logger.info(f"[Agent] Checking if on_token is available: {on_token is not None}")
                                     if on_token:
                                         logger.info(f"[Agent] on_token is available, sending stepContent")
-                                        
+
+                                        # 对正式排查步骤（stepContent / stepAnalysis），先发送
+                                        # [STEP_START]...[STEP_END] 切换前端到新 step，再推送
+                                        # stepCommand（来自 bundle），最后推送 stepContent。
+                                        # 统一从 SKILL.md 解析的 _current_skill_step_numbers 取首步号
+                                        _skill_first_step_num = self._current_skill_step_numbers[0] if self._current_skill_step_numbers else 1
+                                        if answer_type in ("stepContent", "stepAnalysis"):
+                                            step_marker = f"[STEP_START:{_skill_first_step_num}]{first_step_name}[STEP_END]"
+                                            logger.info(f"[SkillSteps] Sending proactive step notification for step {_skill_first_step_num}: {first_step_name}")
+                                            on_token(step_marker)
+
+                                        # 若 step_executor 返回 stepBundle，先把 stepCommand 等
+                                        # 附加消息推送给前端，再把最后一条 stepContent 当作 step_result
+                                        # forced_step 强制 stepCommand/stepContent 的 currentStep 与 SKILL.md 一致
+                                        bundle_handled, step_result = self._emit_step_bundle_if_present(step_result, on_token, forced_step=_skill_first_step_num)
+                                        if bundle_handled:
+                                            logger.info("[Agent] stepBundle detected, stepCommand pushed before stepContent")
+
                                         # Send the appropriate message based on answer_type
                                         if answer_type == "stepContent":
-                                            # Only send step name for formal troubleshooting (not for info request)
-                                            step_marker = f"[STEP_START]{first_step_name}[STEP_END]"
-                                            logger.info(f"[SkillSteps] Sending proactive step notification for step 1: {first_step_name}")
-                                            on_token(step_marker)
+                                            # step_marker 已在上方发送
+                                            # 兜底：对排查步骤的 stepContent 再次确保 currentStep 与 SKILL.md 一致
+                                            step_result = self._override_currentstep(step_result, _skill_first_step_num)
                                             logger.info("[Agent] Sending stepContent to frontend")
                                             on_token(step_result)
+                                            try:
+                                                import time as _time
+                                                _time.sleep(3)
+                                            except Exception:
+                                                pass
                                         elif answer_type == "stepAnalysis":
-                                            # Only send step name for formal troubleshooting (not for info request)
-                                            step_marker = f"[STEP_START]{first_step_name}[STEP_END]"
-                                            logger.info(f"[SkillSteps] Sending proactive step notification for step 1: {first_step_name}")
-                                            on_token(step_marker)
+                                            # step_marker 已在上方发送
+                                            step_result = self._override_currentstep(step_result, _skill_first_step_num)
                                             logger.info("[Agent] Sending stepAnalysis to frontend")
                                             on_token(step_result)
                                         elif answer_type == "stepCommand":
                                             # Fallback: if still getting stepCommand, log warning
+                                            step_result = self._override_currentstep(step_result, _skill_first_step_num)
                                             logger.warning("[Agent] Received stepCommand instead of stepContent - script may not be executing correctly")
                                             on_token(step_result)
                                         elif answer_type == "conversation":
@@ -2256,11 +2412,31 @@ Don't repeat this if `bot_name` already exists in memory.
                                                 if current_step_idx >= len(self._current_skill_steps):
                                                     logger.info(f"[Agent] All steps completed, exiting step execution loop")
                                                     # Skill execution complete, clear skill state
+                                                    # 在清空 _current_skill_step_numbers 之前先取出最大步骤号（来自 SKILL.md）
+                                                    _final_step_num = max(self._current_skill_step_numbers) if self._current_skill_step_numbers else 7
                                                     self._current_skill_steps = []
                                                     self._current_skill_step_numbers = []
                                                     self._session_step_indices.pop(session_id_for_step, None)
-                                                    # Return completion message
-                                                    return "所有故障排查步骤执行完成。"
+                                                    # Return completion message in conversation format
+                                                    summary_text = (
+                                                        "静态路由故障排查完成。<br/><br/>"
+                                                        "诊断结果：已完成所有故障排查步骤。<br/><br/>"
+                                                        "建议：根据各步骤分析结果进行相应配置调整。<br/>"
+                                                    )
+                                                    completion_result = {
+                                                        "answerType": "conversation",
+                                                        "contextEnd": "false",
+                                                        "contextId": skill_args.get("context_id", ""),
+                                                        "currentStep": _final_step_num,
+                                                        "message": summary_text,
+                                                        "questionNo": skill_args.get("question_no", ""),
+                                                        "sessionId": self.session_id or "default"
+                                                    }
+                                                    completion_json = json.dumps(completion_result, ensure_ascii=False)
+                                                    if on_token:
+                                                        logger.info("[Agent] Emitting final conversation summary to frontend (all steps completed)")
+                                                        on_token(completion_json)
+                                                    return completion_json
                                                 next_step_name = self._current_skill_steps[current_step_idx]
                                                 # Get actual step number from SKILL.md
                                                 next_step_number = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
@@ -2284,16 +2460,26 @@ Don't repeat this if `bot_name` already exists in memory.
                                                 self._current_skill_step_numbers = []
                                                 self._session_step_indices.pop(session_id_for_step, None)
                                                 # Return completion message in conversation format
+                                                summary_text = (
+                                                    "静态路由故障排查完成。<br/><br/>"
+                                                    "诊断结果：已完成所有故障排查步骤。<br/><br/>"
+                                                    "建议：根据各步骤分析结果进行相应配置调整。<br/>"
+                                                )
                                                 completion_result = {
                                                     "answerType": "conversation",
                                                     "contextEnd": "false",
                                                     "contextId": skill_args.get("context_id", ""),
                                                     "currentStep": next_step_number,
-                                                    "message": "静态路由故障排查完成。\n\n诊断结果：已完成所有故障排查步骤。\n\n建议：根据各步骤分析结果进行相应配置调整。",
+                                                    "message": summary_text,
                                                     "questionNo": skill_args.get("question_no", ""),
                                                     "sessionId": self.session_id or "default"
                                                 }
-                                                return json.dumps(completion_result, ensure_ascii=False)
+                                                completion_json = json.dumps(completion_result, ensure_ascii=False)
+                                                # 推送一条 conversation 总结消息给前端
+                                                if on_token:
+                                                    logger.info("[Agent] Emitting final conversation summary to frontend")
+                                                    on_token(completion_json)
+                                                return completion_json
                                             
                                             logger.info(f"[Agent] Executing next step directly: step {next_step_number}: {next_step_name}")
                                             
@@ -2378,12 +2564,29 @@ Don't repeat this if `bot_name` already exists in memory.
                                                 if on_token:
                                                     on_token(next_step_result)
                                                 return next_step_result
-                                            
-                                            # Send next step result to frontend
+
+                                            # 先发送 [STEP_START]...[STEP_END] 切换前端到新 step
+                                            # next_step_number 来自 _current_skill_step_numbers（SKILL.md）
                                             if on_token:
-                                                step_marker = f"[STEP_START]{next_step_name}[STEP_END]"
+                                                step_marker = f"[STEP_START:{next_step_number}]{next_step_name}[STEP_END]"
                                                 on_token(step_marker)
+
+                                            # 若返回 stepBundle，先推送 stepCommand 等附加消息
+                                            # forced_step 强制 stepCommand/stepContent 的 currentStep 与 SKILL.md 一致
+                                            bundle_handled, next_step_result = self._emit_step_bundle_if_present(next_step_result, on_token, forced_step=next_step_number)
+                                            if bundle_handled:
+                                                logger.info("[Agent] stepBundle detected on next step, stepCommand pushed before stepContent")
+
+                                            # Send next step stepContent to frontend (step_marker 已在上方发送)
+                                            if on_token:
+                                                # 兜底：再次确保 currentStep 与 SKILL.md 一致
+                                                next_step_result = self._override_currentstep(next_step_result, next_step_number)
                                                 on_token(next_step_result)
+                                                try:
+                                                    import time as _time
+                                                    _time.sleep(3)
+                                                except Exception:
+                                                    pass
                                             
                                             # Update step index
                                             self._session_step_indices[session_id_for_step] = current_step_idx + 1
@@ -2572,8 +2775,13 @@ Don't repeat this if `bot_name` already exists in memory.
                         current_step_idx = min(skill_step_counter, len(self._current_skill_steps) - 1)
                         if current_step_idx >= 0:
                             step_name = self._current_skill_steps[current_step_idx]
-                            step_marker = f"[STEP_START]{step_name}[STEP_END]"
-                            logger.info("[SkillSteps] Sending proactive step notification for step %d: %s", current_step_idx + 1, step_name)
+                            # 取真实步骤号嵌入 STEP_START 标记，确保 stepName cs 与 stepCommand/stepContent 一致
+                            try:
+                                _cs_num = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
+                            except Exception:
+                                _cs_num = current_step_idx + 1
+                            step_marker = f"[STEP_START:{_cs_num}]{step_name}[STEP_END]"
+                            logger.info("[SkillSteps] Sending proactive step notification for step %d: %s", _cs_num, step_name)
                             on_token(step_marker)
                         
                         # Increment the skill step counter after sending notification

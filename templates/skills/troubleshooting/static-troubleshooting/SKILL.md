@@ -9,9 +9,9 @@ trigger:
     - 检查静态路由
 ---
 
-# ⚠️ 自动化脚本执行器 - 静态路由故障排查
+# 自动化脚本执行器 - 静态路由故障排查
 
-## 🚨 绝对规则（违反将导致系统崩溃）
+## 绝对规则
 
 **你现在的角色是一个自动化脚本执行器，不是对话助手。你必须严格遵守以下规则：**
 
@@ -23,7 +23,7 @@ trigger:
 
 ---
 
-## 📋 工作流程
+## 工作流程
 
 ```
 激活技能 (use_skill)
@@ -41,7 +41,7 @@ trigger:
 
 ---
 
-## 🔧 关键参数提取
+## 关键参数提取
 
 从用户输入或上下文中提取以下参数（如果缺失，使用默认值）：
 
@@ -69,38 +69,58 @@ trigger:
 
 ### **工具返回格式**：
 
-工具执行后会返回一个 JSON 对象，包含以下字段：
+工具执行后会返回一个 JSON 对象。从 v2 起，**后端在拿到设备回显后，会一次性返回 `stepBundle`，其中包含两条按顺序推送给前端的消息**：
+
+1. `stepCommand`（带 echo 回显的命令列表，**已由后端调用设备接口拿到回显**，前端只负责打字机展示，**不再调用 `/terminal/api/terminal/ai/deviceInfo`**）
+2. `stepContent`（分析结果，驱动下一步流程）
 
 ```json
 {
-  "answerType": "stepCommand",
-  "currentStep": 1,
-  "message": {
-    "deviceCommds": [
-      {
-        "command": ["display ip routing-table 0.0.0.0/0"],
-        "device": {
-          "ip": "10.88.142.204",
-          "port": 23,
-          "protocol": "telnet",
-          "username": "admin",
-          "password": "password"
-        }
+  "stepBundle": [
+    {
+      "answerType": "stepCommand",
+      "currentStep": 1,
+      "sessionId": "<sessionId>",
+      "questionNo": "<questionNo>",
+      "contextId": "<contextId>",
+      "contextEnd": "false",
+      "message": {
+        "commands": [
+          {
+            "index": 0,
+            "command": "display ip routing-table 0.0.0.0/0",
+            "echo": "display ip routing-table 0.0.0.0/0\r\n...回显文本..."
+          }
+        ],
+        "sessionId": "<sessionId>"
       }
-    ]
-  },
-  "analysis_result": {
-    "route_exists": true,
-    "next_step": "step2"
-  }
+    },
+    {
+      "answerType": "stepContent",
+      "currentStep": 1,
+      "sessionId": "<sessionId>",
+      "questionNo": "<questionNo>",
+      "contextId": "<contextId>",
+      "contextEnd": "false",
+      "message": "分析结论文本...",
+      "nextStep": "step2"
+    }
+  ],
+  "answerType": "stepContent",
+  "currentStep": 1,
+  "message": "分析结论文本...",
+  "nextStep": "step2"
 }
 ```
 
-**关键**：你需要从返回结果中提取 `analysis_result.next_step` 字段，它告诉你下一步应该执行哪个脚本。
+> 顶层冗余的 `answerType / currentStep / message / nextStep` 字段是为了与旧版上层逻辑兼容；
+> 真正按顺序发给前端的是 `stepBundle` 数组中的两条消息。
+
+**关键**：你需要从返回结果中提取 `nextStep`（或 `analysis_result.next_step`）字段，它告诉你下一步应该执行哪个脚本。
 
 ---
 
-## 📝 步骤详解
+## 步骤详解
 ### **第0步：获取拓扑图**
 
 > 进入正式排查前，必须先调用拓扑接口拉取整网拓扑并把结果发送给前端。

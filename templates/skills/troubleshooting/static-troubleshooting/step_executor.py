@@ -144,7 +144,7 @@ def execute_device_command(
             DEVICE_INFO_ENDPOINT,
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=30
+            timeout=60
         )
         response.raise_for_status()
         
@@ -681,6 +681,11 @@ def main():
         # Determine the analysis type (use step_type as fallback)
         effective_analysis_type = analysis_type or step_type
         
+        # Debug: Print analysis type info
+        print(f"# [DEBUG] analysis_type: '{analysis_type}'", file=sys.stderr)
+        print(f"# [DEBUG] step_type: '{step_type}'", file=sys.stderr)
+        print(f"# [DEBUG] effective_analysis_type: '{effective_analysis_type}'", file=sys.stderr)
+        
         # Auto-generate session_id if not provided
         if not session_id:
             import uuid
@@ -857,6 +862,11 @@ def main():
             print(f"#   Command {i+1}: {cmd}", file=sys.stderr)
         
         # For check_nexthop analysis type, we need to extract nexthop_ip from routing table first
+        # Debug: Check if we should enter check_nexthop branch
+        print(f"# [DEBUG] Checking check_nexthop condition:", file=sys.stderr)
+        print(f"# [DEBUG]   effective_analysis_type == 'check_nexthop': {effective_analysis_type == 'check_nexthop'}", file=sys.stderr)
+        print(f"# [DEBUG]   '{{{{nexthop_ip}}}}' in commands: {'{{nexthop_ip}}' in str(commands)}", file=sys.stderr)
+        
         if effective_analysis_type == "check_nexthop" and "{{nexthop_ip}}" in str(commands):
             print(f"# [check_nexthop] Need to extract nexthop_ip first", file=sys.stderr)
             # Find the routing-table command (the one without nexthop_ip placeholder)
@@ -887,7 +897,7 @@ def main():
                     DEVICE_INFO_ENDPOINT,
                     json=route_payload,
                     headers={"Content-Type": "application/json"},
-                    timeout=30
+                    timeout=60
                 )
                 route_response.raise_for_status()
                 route_result = route_response.json()
@@ -940,7 +950,7 @@ def main():
                 DEVICE_INFO_ENDPOINT,
                 json=api_payload,
                 headers={"Content-Type": "application/json"},
-                timeout=30
+                timeout=60
             )
             response.raise_for_status()
             api_response = response.json()
@@ -1021,19 +1031,67 @@ def main():
             analyzer = ANALYSIS_HANDLERS[effective_analysis_type]
             analysis_result = analyzer(combined_output)
 
-            # Step 5: Return analysis result in stepContent format for frontend
-            result = {
-                "answerType": "stepContent",
+            # ============================================================
+            # Step 5: 组装 stepBundle —— 先 stepCommand（带 echo 回显），
+            # 再 stepContent（分析结果）。前端只负责打字机展示，不再调
+            # /terminal/api/terminal/ai/deviceInfo 接口。
+            # ============================================================
+            context_id_val = params.get("context_id", "")
+            question_no_val = params.get("question_no", "")
+
+            # 5.1 构造 stepCommand 消息：commands[].echo 已经带回显，前端
+            #     检测到 echo 存在时会跳过对 deviceInfo 接口的调用，直接渲染
+            step_command_commands = []
+            for i, item in enumerate(api_responses):
+                step_command_commands.append({
+                    "index": i,
+                    "command": item["command"],
+                    # echo 直接给字符串（前端 messageStore 已兼容 string 形式：
+                    # 见 messageStore handleMessage 中 `if typeof echo === "string"` 分支）
+                    "echo": item["output"]
+                })
+
+            step_command_msg = {
+                "answerType": "stepCommand",
                 "contextEnd": "false",
-                "contextId": params.get("context_id", ""),
-                "currentStep": analysis_result.get("step", 0),
-                "message": analysis_result.get("message", ""),
-                "questionNo": params.get("question_no", ""),
-                "sessionId": session_id,
-                "nextStep": analysis_result.get("next_step", "")  # Add nextStep for agent to determine next step
+                "contextId": context_id_val,
+                "currentStep": analysis_result.get("step", step_number),
+                "message": {
+                    "commands": step_command_commands,
+                    "sessionId": session_id
+                },
+                "questionNo": question_no_val,
+                "sessionId": session_id
             }
 
-            print(json.dumps(result, ensure_ascii=False))
+            # 5.2 构造 stepContent 分析结果消息
+            step_content_msg = {
+                "answerType": "stepContent",
+                "contextEnd": "false",
+                "contextId": context_id_val,
+                "currentStep": analysis_result.get("step", 0),
+                "message": analysis_result.get("message", ""),
+                "questionNo": question_no_val,
+                "sessionId": session_id,
+                "nextStep": analysis_result.get("next_step", "")
+            }
+
+            # 5.3 输出 bundle：agent 端会按顺序逐条推送给前端
+            bundle = {
+                "stepBundle": [step_command_msg, step_content_msg],
+                # 兼容字段：保留 stepContent 顶层字段，方便上层逻辑判断 answerType
+                # 仍然按 stepContent 推进步骤
+                "answerType": step_content_msg["answerType"],
+                "contextEnd": step_content_msg["contextEnd"],
+                "contextId": step_content_msg["contextId"],
+                "currentStep": step_content_msg["currentStep"],
+                "message": step_content_msg["message"],
+                "questionNo": step_content_msg["questionNo"],
+                "sessionId": step_content_msg["sessionId"],
+                "nextStep": step_content_msg["nextStep"]
+            }
+
+            print(json.dumps(bundle, ensure_ascii=False))
 
         except Exception as e:
             import traceback

@@ -32,6 +32,9 @@ from ..core.skill_loader import SkillRegistry
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
+# 前端 Vite 构建产物目录（front/dist），用于让 FastAPI 同时托管前端 SPA，
+# 避免前后端跑在两个端口时调 SSE 出现 501 的问题
+FRONT_DIST_DIR = Path(__file__).resolve().parents[2] / "front" / "dist"
 
 _agents: dict[str, Agent] = {}
 _provider: LLMProvider | None = None
@@ -104,7 +107,62 @@ def create_app(provider: LLMProvider | None, *, build_provider_fn=None) -> FastA
     app.add_api_websocket_route("/ws/chat", _ws_chat)
     app.add_api_route("/chatbot/upload", _api_chatbot_upload, methods=["POST"])
     app.add_api_route("/dm/cancas/chat", _sse_chat, methods=["POST"])
+    # 同时注册带 /api 前缀的别名，匹配前端 dist 中硬编码的 /api/dm/cancas/chat
+    app.add_api_route("/api/dm/cancas/chat", _sse_chat, methods=["POST"])
     # app.add_api_route("/chatbot/dm/claw/stream", _sse_chat, methods=["POST"])
+
+    # ----------------------------------------------------------------
+    # 把前端 Vite 构建产物（front/dist）挂载到 FastAPI，让前后端跑在同一
+    # 端口（默认 9011），避免前端用 python -m http.server 等只支持 GET
+    # 的静态服务托管时，POST /api/dm/cancas/chat 返回 501 的问题。
+    #
+    # 浏览器访问 http://localhost:9011/ 即可加载 dist/index.html，
+    # 所有 /assets /image 等绝对路径资源由 FastAPI 直接 serve。
+    # 挂载放到最后，确保不会覆盖上面注册的所有 API 路由。
+    # ----------------------------------------------------------------
+    if FRONT_DIST_DIR.exists():
+        assets_dir = FRONT_DIST_DIR / "assets"
+        if assets_dir.exists():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="dist_assets")
+        image_dir = FRONT_DIST_DIR / "image"
+        if image_dir.exists():
+            app.mount("/image", StaticFiles(directory=str(image_dir)), name="dist_image")
+        # 兜底：dist 根目录下的散落文件（loading.js / _app.config.js / *.png / logo.ico 等）
+        # 注意：必须使用 html=False，否则会与 / 路由冲突
+        app.mount("/dist", StaticFiles(directory=str(FRONT_DIST_DIR), html=False), name="dist_root")
+
+        # 把 dist 根目录下被前端用绝对路径引用的散落文件单独注册到 FastAPI 根路径，
+        # 例如 /_app.config.js / /loading.js / /logo.ico / /iconfont.js / /device*.png 等
+        for fp in FRONT_DIST_DIR.iterdir():
+            if not fp.is_file():
+                continue
+            if fp.name.lower() == "index.html":
+                continue  # 已由 _serve_index 处理
+            route_path = "/" + fp.name
+            # 为每个文件创建一个独立的闭包，避免捕获循环变量
+            def _make_handler(name: str):
+                async def _handler():
+                    from fastapi.responses import FileResponse
+                    return FileResponse(str(FRONT_DIST_DIR / name))
+                return _handler
+            app.add_api_route(route_path, _make_handler(fp.name), methods=["GET"], include_in_schema=False)
+
+        logger.info(f"[FastAPI] Mounted frontend dist from {FRONT_DIST_DIR}")
+
+        # 为前端SPA添加catch-all路由，处理Vue Router的history模式
+        # 当直接访问 /ai-post 等前端路由时，返回index.html让前端路由接管
+        @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
+        async def _spa_fallback(full_path: str):
+            # 排除API路由和静态资源路由
+            if full_path.startswith("api/") or full_path.startswith("static/"):
+                from fastapi.responses import Response
+                return Response(status_code=404)
+            dist_index = FRONT_DIST_DIR / "index.html"
+            if dist_index.exists():
+                return HTMLResponse(dist_index.read_text(encoding="utf-8"))
+            return Response(status_code=404)
+    else:
+        logger.warning(f"[FastAPI] Frontend dist directory not found: {FRONT_DIST_DIR}")
 
     return app
 
@@ -149,8 +207,26 @@ def _reset_agent(session_id: str | None = None) -> None:
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
 async def _serve_index():
+    # 优先返回前端 Vite 构建产物的 index.html（front/dist/index.html）
+    dist_index = FRONT_DIST_DIR / "index.html"
+    if dist_index.exists():
+        return HTMLResponse(dist_index.read_text(encoding="utf-8"))
+    # 兜底：旧的 PythonClaw Dashboard 页面
     index_path = STATIC_DIR / "index.html"
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
+
+
+async def _serve_dist_root_file(file_name: str):
+    """Serve dist 根目录下的散落文件（loading.js / _app.config.js / *.png / *.ico
+    等被前端绝对路径引用的文件）。
+    """
+    from fastapi.responses import FileResponse, Response
+
+    safe_name = Path(file_name).name  # 防止路径穿越
+    target = FRONT_DIST_DIR / safe_name
+    if not target.exists() or not target.is_file():
+        return Response(status_code=404)
+    return FileResponse(str(target))
 
 
 # ── REST API ──────────────────────────────────────────────────────────────────
@@ -1033,8 +1109,10 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
         logger.info("[StepMarker] Not a valid JSON: %s", str(e))
         pass  # Not a JSON, continue with normal processing
     
-    # Pattern to match [STEP_START]content[STEP_END]
-    pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
+    # Pattern to match [STEP_START]content[STEP_END] 或 [STEP_START:N]content[STEP_END]
+    # 新格式由 agent.py 发出，N 是 step_executor 输出的真实 currentStep；
+    # 老格式保持兼容（无 :N 时回退用 step_counter 自增）
+    pattern = r'\[STEP_START(?::(\d+))?\](.*?)\[STEP_END\]'
     
     matches = list(re.finditer(pattern, text))
     logger.info("[StepMarker] Found %d step markers", len(matches))
@@ -1048,17 +1126,29 @@ def process_step_markers(sessionId: str, text: str, contextId: str = None, quest
                 logger.info("[StepMarker] Sending normal text: %s", repr(normal_text))
                 messages.append(build_response(sessionId, normal_text, False, 'AI_LIST', contextId))
         
-        # Increment step counter and send step notification
-        step_counter[0] += 1
-        step_name = match.group(1).strip()
-        logger.info("[StepMarker] Sending step %d: %s", step_counter[0], step_name)
+        # 优先使用标记里携带的 step 号；如果没有再用 step_counter+=1 回退
+        explicit_step = match.group(1)
+        step_name = match.group(2).strip()
+        if explicit_step is not None:
+            try:
+                step_num = int(explicit_step)
+            except (TypeError, ValueError):
+                step_num = step_counter[0] + 1
+            # 同步 step_counter，避免后续标记/JSON 处理时出现倒退
+            if step_num > step_counter[0]:
+                step_counter[0] = step_num
+            current_step_for_marker = step_num
+        else:
+            step_counter[0] += 1
+            current_step_for_marker = step_counter[0]
+        logger.info("[StepMarker] Sending step %d: %s", current_step_for_marker, step_name)
         messages.append(build_response(
             sessionId, 
             step_name, 
             False, 
             'STEP_NOTIFICATION',
             contextId,
-            step_counter[0],
+            current_step_for_marker,
             questionNo
         ))
         
