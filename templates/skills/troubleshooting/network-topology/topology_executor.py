@@ -1,5 +1,5 @@
 """
-Topology Executor for Static Route Troubleshooting
+Topology Executor for Network Topology Skill
 
 This script fetches the network topology from a third-party API and
 returns three pieces of frontend-bound messages so the agent can

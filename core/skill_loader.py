@@ -75,7 +75,7 @@ class CategoryMetadata:
 class SkillMetadata:
     """Level 1 — lightweight metadata for a single skill."""
 
-    __slots__ = ("name", "description", "path", "category", "emoji", "dependencies")
+    __slots__ = ("name", "description", "path", "category", "emoji", "dependencies", "fetch_topology")
 
     def __init__(
         self,
@@ -85,6 +85,7 @@ class SkillMetadata:
         category: str = "",
         emoji: str = "",
         dependencies: list[str] | None = None,
+        fetch_topology: bool = False,
     ) -> None:
         self.name = name
         self.description = description
@@ -92,6 +93,7 @@ class SkillMetadata:
         self.category = category
         self.emoji = emoji
         self.dependencies: list[str] = dependencies or []
+        self.fetch_topology: bool = fetch_topology
 
 
 class Skill:
@@ -278,6 +280,10 @@ class SkillRegistry:
             if raw_deps:
                 deps = SkillRegistry._parse_deps(raw_deps)
 
+            fetch_topology = meta.get("fetch_topology", False)
+            if isinstance(fetch_topology, str):
+                fetch_topology = fetch_topology.lower() == "true"
+
             return SkillMetadata(
                 name=name,
                 description=description,
@@ -285,6 +291,7 @@ class SkillRegistry:
                 category=category,
                 emoji=emoji,
                 dependencies=deps,
+                fetch_topology=fetch_topology,
             )
         except OSError as exc:
             logger.warning("Could not read skill at '%s': %s", md_path, exc)
@@ -312,6 +319,18 @@ class SkillRegistry:
             except OSError as exc:
                 logger.error("Error loading skill '%s': %s", name, exc)
                 return None
+        return None
+
+    def _get_skill_metadata(self, name: str) -> SkillMetadata | None:
+        """
+        Get the metadata for a skill by name (**Level 1**).
+        
+        This is a lightweight operation that returns only the metadata
+        without loading the full skill instructions.
+        """
+        for meta in self.discover():
+            if meta.name == name:
+                return meta
         return None
 
     # ── Level 3: Resource discovery ──────────────────────────────────────

@@ -2110,24 +2110,39 @@ Don't repeat this if `bot_name` already exists in memory.
                                     
                                     first_step_name = self._current_skill_steps[0]
                                     
-                                    # ── Step 0: 获取网络拓扑图 ──────────────────────
-                                    # 在执行第一步排查脚本之前，先调用第三方拓扑接口
-                                    # 并按约定顺序向前端发送三条 SSE 消息
+                                    # ── Step 0: 获取网络拓扑图（根据技能配置决定是否执行）──────────────────────
+                                    # 在执行第一步排查脚本之前，先检查技能配置是否需要获取拓扑图
+                                    need_fetch_topology = False
                                     try:
+                                        # 从 forced_tool_call 参数中获取技能名称
                                         skill_args_for_topo = json.loads(forced_tool_call.function.arguments) if isinstance(forced_tool_call.function.arguments, str) else (forced_tool_call.function.arguments or {})
-                                    except Exception:
-                                        skill_args_for_topo = {}
-                                    # 优先使用 web 层注入的前端上下文（contextId/questionNo/sessionId），
-                                    # 这样发给前端的 SSE 消息能与前端原始请求匹配上
-                                    topo_session_id = getattr(self, "frontend_session_id", None) or self.session_id or "default"
-                                    topo_context_id = getattr(self, "frontend_context_id", None) or skill_args_for_topo.get("context_id", "")
-                                    topo_question_no = getattr(self, "frontend_question_no", None) or skill_args_for_topo.get("question_no", "")
-                                    self._fetch_and_emit_topology(
-                                        session_id=topo_session_id,
-                                        context_id=topo_context_id,
-                                        question_no=topo_question_no,
-                                        on_token=on_token,
-                                    )
+                                        skill_name_for_topo = skill_args_for_topo.get("skill_name", "")
+                                        
+                                        # 获取技能的 metadata 配置
+                                        if skill_name_for_topo:
+                                            skill_meta = self._registry._get_skill_metadata(skill_name_for_topo)
+                                            if skill_meta and hasattr(skill_meta, 'fetch_topology'):
+                                                need_fetch_topology = skill_meta.fetch_topology
+                                                logger.info(f"[Agent] Skill '{skill_name_for_topo}' fetch_topology config: {need_fetch_topology}")
+                                    except Exception as e:
+                                        logger.warning(f"[Agent] Failed to check fetch_topology config: {e}")
+                                        # 默认不获取拓扑图
+                                        need_fetch_topology = False
+                                    
+                                    if need_fetch_topology:
+                                        # 在执行第一步排查脚本之前，先调用第三方拓扑接口
+                                        # 并按约定顺序向前端发送三条 SSE 消息
+                                        # 优先使用 web 层注入的前端上下文（contextId/questionNo/sessionId），
+                                        # 这样发给前端的 SSE 消息能与前端原始请求匹配上
+                                        topo_session_id = getattr(self, "frontend_session_id", None) or self.session_id or "default"
+                                        topo_context_id = getattr(self, "frontend_context_id", None) or skill_args_for_topo.get("context_id", "")
+                                        topo_question_no = getattr(self, "frontend_question_no", None) or skill_args_for_topo.get("question_no", "")
+                                        self._fetch_and_emit_topology(
+                                            session_id=topo_session_id,
+                                            context_id=topo_context_id,
+                                            question_no=topo_question_no,
+                                            on_token=on_token,
+                                        )
                                     
                                     # If we already have a step result from forced tool call (is_step_result),
                                     # skip re-executing the first step to avoid duplicate execution

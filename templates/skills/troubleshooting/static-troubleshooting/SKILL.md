@@ -1,6 +1,7 @@
 ---
 name: static-troubleshooting
 description: 静态路由故障排查，用于排查网络设备静态路由故障的标准流程，包含路由存在性、下一跳可达性、接口状态及优先级检查
+fetch_topology: false
 trigger:
   type: keyword
   keywords:
@@ -121,59 +122,7 @@ trigger:
 ---
 
 ## 步骤详解
-### **第0步：获取拓扑图**
 
-> 进入正式排查前，必须先调用拓扑接口拉取整网拓扑并把结果发送给前端。
-> 本步骤由后端在激活技能后自动执行，每个会话仅执行一次。
-
-**立即执行**：调用 `execute_topology_script` 工具
-
-**工具参数（参数值由后端从前端 SSE 请求体中自动透传，无需 LLM 推断）**：
-
-前端 SSE 请求体示例：
-```json
-{
-  "sessionId": "session_1775815112081_634arvfy1",
-  "userId": 76710,
-  "question": "静态路由故障排查",
-  "fileId": "",
-  "contextId": "328fd78b-289f-4a4a-8484-9cac209a7963"
-}
-```
-
-工具调用参数：
-```json
-{
-  "params": {
-    "sessionId": "<取自前端请求体 sessionId>",
-    "contextId": "<取自前端请求体 contextId>",
-    "questionNo": "<后端拼接：sessionId + 当前时间戳(ms)，如 session_1775815112081_634arvfy11779414345284>"
-  }
-}
-```
-
-> 注：脚本 [topology_executor.py](./topology_executor.py) 同时兼容 `session_id/context_id/question_no` 蛇形写法。
-
-**底层行为**：
-1. 加载 `file/devices.json` 中所有设备，按 `[ {ip,userName,password,port,protocol,chassisId,deviceName,deviceCategory,deviceModel,deviceId}, ... ]` 结构透传
-2. 调用第三方接口 `POST http://127.0.0.1:20160/api/deviceTopology/get`
-3. 取响应 `data` 中的 `nodes` 与 `edges`
-
-**发送给前端的三条消息（顺序固定，结构严格按下方约定）**：
-
-```json
-{"answerType":"conversation","contextEnd":"false","contextId":"<透传前端 contextId>","currentStep":0,"message":"网络拓扑图获取中...<br/>","questionNo":"<后端拼接的 questionNo>","sessionId":"<透传前端 sessionId>"}
-```
-
-```json
-{"answerType":"topology","contextEnd":"false","contextId":"<透传前端 contextId>","currentStep":0,"message":{"edges":[...],"nodes":[...]},"questionNo":"<后端拼接的 questionNo>","sessionId":"<透传前端 sessionId>"}
-```
-
-```json
-{"answerType":"conversation","contextEnd":"false","contextId":"<透传前端 contextId>","currentStep":0,"message":"获取成功","questionNo":"<后端拼接的 questionNo>","sessionId":"<透传前端 sessionId>"}
-```
-
-**完成后**：自动进入【第一步】流程，不需要等待。
 
 
 ### **第一步：检查全局路由表中是否存在该静态路由**
