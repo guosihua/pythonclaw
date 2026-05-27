@@ -173,8 +173,6 @@ class IntentRecognizer:
                 (r'"意图"\s*[：:]\s*["\']([^"\']+)["\']', r'"技能"\s*[：:]\s*["\']([^"\']+)["\']'),
                 # 解释文本中的格式: intent可以设为"xxx", skill设为"xxx"
                 (r'intent[可以设为合适选择]*[：:\s]*["\']([^"\']+)["\']', r'skill[可以设为合适选择]*[：:\s]*["\']([^"\']+)["\']'),
-                # 直接提取 troubleshooting 和 static-troubleshooting
-                (r'troubleshooting', r'static-troubleshooting'),
             ]
 
             for intent_pattern, skill_pattern in patterns:
