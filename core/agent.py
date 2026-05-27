@@ -41,6 +41,7 @@ from .knowledge.rag import KnowledgeRAG
 from .llm.base import LLMProvider
 from .memory.manager import MemoryManager
 from .skill_loader import SkillRegistry
+from .intent_recognizer import IntentRecognizer
 from .tools import (
     AVAILABLE_TOOLS,
     CRON_TOOLS,
@@ -305,9 +306,9 @@ class Agent:
         self.loaded_skill_names: set[str] = set()
         self.pending_injections: list[str] = []
         self._session_step_indices: dict[str, int] = {}  # Track step progress per session
-        self._current_skill_steps: list[str] = []  # Store current skill's steps
-        self._current_skill_step_numbers: list[int] = []  # Store actual step numbers from SKILL.md
-        self._current_skill_step_commands: dict[int, list[str]] = {}  # Store commands for each step from SKILL.md (key: step_number)
+        self._current_skill_steps: dict[str, list[str]] = {}  # Store current skill's steps per session
+        self._current_skill_step_numbers: dict[str, list[int]] = {}  # Store actual step numbers from SKILL.md per session
+        self._current_skill_step_commands: dict[str, dict[int, list[str]]] = {}  # Store commands for each step from SKILL.md per session (key: step_number)
         self._session_device_info: dict[str, dict] = {}  # Cache device_info per session for reuse across steps
         self._session_destination_network: dict[str, str] = {}  # Cache destination_network per session for reuse across steps
         self._session_topology_fetched: set[str] = set()  # Track which sessions already fetched topology (step 0)
@@ -644,7 +645,7 @@ Don't repeat this if `bot_name` already exists in memory.
 
     # ── Tool call parsing fallbacks ────────────────────────────────────────────
 
-    def _create_forced_tool_call(self):
+    def _create_forced_tool_call(self, skill_name=None):
         """Create a forced tool call when LLM fails to call tools despite strong prompts.
         
         This is used when:
@@ -652,15 +653,40 @@ Don't repeat this if `bot_name` already exists in memory.
         2. LLM returns empty content or no tool calls
         3. We need to force skill activation or continue pending steps
         
+        Args:
+            skill_name: Optional skill name to use directly (avoids re-calling LLM)
+        
         Returns MockToolCall object or None if no appropriate skill found.
         """
         from .llm.response import MockFunction, MockToolCall
         
         try:
-            # Check if a troubleshooting skill is already active with pending steps
-            if hasattr(self, '_current_skill_steps') and self._current_skill_steps:
-                logger.info(f"[Agent] Skill already active with {len(self._current_skill_steps)} pending steps")
-                logger.info(f"[Agent] Pending steps: {self._current_skill_steps}")
+            # Get session_id
+            session_id_for_check = self.session_id or "default"
+            
+            # If skill_name is provided, use it directly without calling LLM
+            current_steps = self._current_skill_steps.get(session_id_for_check, [])
+            if skill_name and not current_steps:
+                logger.info(f"[Agent] Using provided skill name directly: {skill_name}")
+                skills = self._registry.discover()
+                skill_names = [s.name for s in skills]
+                if skill_name in skill_names:
+                    logger.info(f"[Agent] Force-activating skill: {skill_name}")
+                    arguments_json = json.dumps({"skill_name": skill_name})
+                    return MockToolCall(
+                        id=f"call_forced_{int(time.time())}",
+                        function=MockFunction(name="use_skill", arguments=arguments_json),
+                        type="function"
+                    )
+                else:
+                    logger.warning(f"[Agent] Skill '{skill_name}' not found in registry")
+                    return None
+            
+            # Check if a troubleshooting skill is already active with pending steps for this session
+            current_steps = self._current_skill_steps.get(session_id_for_check, [])
+            if current_steps:
+                logger.info(f"[Agent] Skill already active with {len(current_steps)} pending steps")
+                logger.info(f"[Agent] Pending steps: {current_steps}")
                 
                 # Skill is already active, we need to continue execution
                 # Check if user provided supplementary information
@@ -701,13 +727,19 @@ Don't repeat this if `bot_name` already exists in memory.
                     # Get current step using session_id to track progress
                     session_id_for_step = self.session_id or "default"
                     current_step = self._session_step_indices.get(session_id_for_step, 0)
-                    first_step_name = self._current_skill_steps[current_step] if current_step < len(self._current_skill_steps) else self._current_skill_steps[0]
+                    
+                    # Get skill steps for this session
+                    session_steps = self._current_skill_steps.get(session_id_for_step, [])
+                    session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                    session_step_commands = self._current_skill_step_commands.get(session_id_for_step, {})
+                    
+                    first_step_name = session_steps[current_step] if current_step < len(session_steps) else (session_steps[0] if session_steps else "")
                     logger.info(f"[Agent] Session: {session_id_for_step}, Current step: {current_step}, step name: {first_step_name}")
                     
                     # Get actual step number from SKILL.md
-                    actual_step_num = self._current_skill_step_numbers[current_step] if current_step < len(self._current_skill_step_numbers) else current_step + 1
+                    actual_step_num = session_step_numbers[current_step] if current_step < len(session_step_numbers) else current_step + 1
                     # Get commands from SKILL.md for this step
-                    skill_commands = self._current_skill_step_commands.get(actual_step_num, [])
+                    skill_commands = session_step_commands.get(actual_step_num, [])
                     
                     # Create execute_step_script arguments
                     step_params = {
@@ -743,20 +775,41 @@ Don't repeat this if `bot_name` already exists in memory.
                     last_user_msg = msg.get("content", "")
                     break
             
-            # Detect troubleshooting intent
-            troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由']
-            has_troubleshooting_intent = any(kw in last_user_msg.lower() for kw in troubleshooting_keywords)
+            # Use LLM-based intent recognition ONLY for troubleshooting detection
+            # 必须使用大模型进行意图检测，不使用关键词匹配
+            has_troubleshooting_intent = False
+            
+            try:
+                # Get available skills
+                skills = self._registry.discover()
+                
+                # Create intent recognizer
+                intent_recognizer = IntentRecognizer(self.provider)
+                
+                # Recognize intent using LLM
+                intent, skill_name = intent_recognizer.recognize_intent(last_user_msg, skills)
+                
+                logger.info(f"[Agent] LLM intent recognition result - intent: {intent}, skill: {skill_name}")
+                
+                # If LLM recognizes troubleshooting intent, set flag
+                if intent == "troubleshooting":
+                    has_troubleshooting_intent = True
+                    logger.info(f"[Agent] LLM detected troubleshooting intent")
+                    
+            except Exception as e:
+                logger.error(f"[Agent] LLM intent recognition failed: {e}. No keyword fallback will be used.")
+            
+            # If LLM didn't detect troubleshooting intent, log warning
+            if not has_troubleshooting_intent:
+                logger.warning(f"[Agent] LLM did not detect troubleshooting intent from: {last_user_msg[:100]}")
             
             # Also detect IP address patterns which might indicate routing troubleshooting
+            # (This is supplementary info, not intent detection)
             import re
             ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
             has_ip_address = bool(re.search(ip_pattern, last_user_msg))
             
-            # If either troubleshooting keywords or IP address found, consider it troubleshooting intent
-            has_troubleshooting_intent = has_troubleshooting_intent or has_ip_address
-            
             logger.info(f"[Agent] Intent detection - last_user_msg: {last_user_msg[:100]}")
-            logger.info(f"[Agent] Intent detection - has_troubleshooting_keywords: {any(kw in last_user_msg.lower() for kw in troubleshooting_keywords)}")
             logger.info(f"[Agent] Intent detection - has_ip_address: {has_ip_address}")
             logger.info(f"[Agent] Intent detection - has_troubleshooting_intent: {has_troubleshooting_intent}")
             
@@ -764,48 +817,34 @@ Don't repeat this if `bot_name` already exists in memory.
                 skills = self._registry.discover()
                 logger.info(f"[Agent] Found {len(skills)} skills in registry")
                 
-                # Extract skill names from SkillMetadata objects
-                skill_names = [s.name for s in skills]
-                logger.info(f"[Agent] Available skill names: {skill_names}")
-                
-                # Skill selection based on keywords in user message
-                # Create a mapping of keywords to skill names
-                skill_keyword_map = [
-                    ('以太口', 'ethernet-port-troubleshooting'),
-                    ('端口', 'ethernet-port-troubleshooting'),
-                    ('接口', 'ethernet-port-troubleshooting'),
-                    ('static', 'static-troubleshooting'),
-                    ('静态路由', 'static-troubleshooting'),
-                    ('路由', 'static-troubleshooting'),
-                ]
-                
+                # Use LLM-based intent recognition ONLY for skill selection
+                # 必须使用大模型进行技能选择，不使用关键词匹配
                 skill_name = None
                 
-                # Find the most specific skill based on user input
-                for keyword, target_skill in skill_keyword_map:
-                    if keyword in last_user_msg and target_skill in skill_names:
-                        skill_name = target_skill
-                        logger.info(f"[Agent] Selected skill '{skill_name}' based on keyword '{keyword}'")
-                        break
-                
-                # Fallback: prefer static-troubleshooting if no specific match
-                if skill_name is None:
-                    if 'static-troubleshooting' in skill_names:
-                        skill_name = 'static-troubleshooting'
-                        logger.info(f"[Agent] Selected skill: {skill_name} (fallback)")
-                    elif 'CT-AP-not-online-zhuwang' in skill_names:
-                        skill_name = 'CT-AP-not-online-zhuwang'
-                        logger.info(f"[Agent] Selected skill: {skill_name} (fallback)")
+                try:
+                    # Create intent recognizer
+                    intent_recognizer = IntentRecognizer(self.provider)
+                    
+                    # Recognize intent and select skill using LLM
+                    intent, skill_name = intent_recognizer.recognize_intent(last_user_msg, skills)
+                    
+                    logger.info(f"[Agent] LLM intent recognition result - intent: {intent}, skill: {skill_name}")
+                    
+                    # Validate skill name
+                    skill_names = [s.name for s in skills]
+                    if skill_name and skill_name in skill_names:
+                        logger.info(f"[Agent] Selected skill '{skill_name}' based on LLM intent recognition")
                     else:
-                        # Find any troubleshooting skill by checking name field
-                        troubleshooting_skills = [s.name for s in skills if 'troubleshoot' in s.name.lower()]
-                        logger.info(f"[Agent] Troubleshooting skills found: {troubleshooting_skills}")
-                        if troubleshooting_skills:
-                            skill_name = troubleshooting_skills[0]
-                            logger.info(f"[Agent] Selected troubleshooting skill: {skill_name}")
-                        else:
-                            logger.warning("[Agent] No troubleshooting skills available")
-                            return None
+                        logger.warning(f"[Agent] LLM returned invalid skill '{skill_name}'. No fallback will be used.")
+                        skill_name = None
+                except Exception as e:
+                    logger.error(f"[Agent] LLM intent recognition failed: {e}. No fallback will be used.")
+                    skill_name = None
+                
+                # If LLM failed to select a skill, do NOT use keyword fallback - just log warning
+                if skill_name is None:
+                    logger.warning("[Agent] No skill selected via LLM. Cannot proceed with skill activation.")
+                    return None
                 
                 logger.info(f"[Agent] Force-activating skill: {skill_name}")
                 arguments_json = json.dumps({"skill_name": skill_name})
@@ -1225,28 +1264,31 @@ Don't repeat this if `bot_name` already exists in memory.
                     step_name = next_step_match.group(1).strip()
                     step_name_to_number[step_name] = step_num
             
-            # Store steps with their actual numbers
-            self._current_skill_steps = steps
-            self._current_skill_step_numbers = [step_name_to_number.get(step, idx + 1) for idx, step in enumerate(steps)]
+            # Store steps with their actual numbers per session
+            session_id_for_skill = self.session_id or "default"
+            self._current_skill_steps[session_id_for_skill] = steps
+            self._current_skill_step_numbers[session_id_for_skill] = [step_name_to_number.get(step, idx + 1) for idx, step in enumerate(steps)]
             logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
-            logger.info("[SkillSteps] Step numbers: %s", self._current_skill_step_numbers[:3])
+            logger.info("[SkillSteps] Step numbers: %s", self._current_skill_step_numbers[session_id_for_skill][:3])
             
             # Extract commands for each step from SKILL.md tool params JSON blocks
-            self._current_skill_step_commands = self._extract_step_commands_from_skill(skill.instructions, step_name_to_number)
-            logger.info("[SkillSteps] Extracted commands per step: %s", self._current_skill_step_commands)
+            self._current_skill_step_commands[session_id_for_skill] = self._extract_step_commands_from_skill(skill.instructions, step_name_to_number)
+            logger.info("[SkillSteps] Extracted commands per step: %s", self._current_skill_step_commands[session_id_for_skill])
         elif steps:
             # Fallback: use sequential numbering if no step numbers found
-            self._current_skill_steps = steps
-            self._current_skill_step_numbers = list(range(1, len(steps) + 1))
+            session_id_for_skill = self.session_id or "default"
+            self._current_skill_steps[session_id_for_skill] = steps
+            self._current_skill_step_numbers[session_id_for_skill] = list(range(1, len(steps) + 1))
             logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
             # Extract commands with sequential numbering
-            self._current_skill_step_commands = self._extract_step_commands_from_skill(
+            self._current_skill_step_commands[session_id_for_skill] = self._extract_step_commands_from_skill(
                 skill.instructions, {s: i+1 for i, s in enumerate(steps)}
             )
         else:
-            self._current_skill_steps = []
-            self._current_skill_step_numbers = []
-            self._current_skill_step_commands = {}
+            session_id_for_skill = self.session_id or "default"
+            self._current_skill_steps[session_id_for_skill] = []
+            self._current_skill_step_numbers[session_id_for_skill] = []
+            self._current_skill_step_commands[session_id_for_skill] = {}
         
         if self.verbose:
             logger.debug("Skill activated: %s (Level 2 loaded)", skill_name)
@@ -1616,6 +1658,7 @@ Don't repeat this if `bot_name` already exists in memory.
 
         user_input = self._normalize_input(user_input) # 处理多模态兼容性
         self.messages.append({"role": "user", "content": user_input})
+        logger.info(f"[Agent] User input after normalization: {user_input[:200] if isinstance(user_input, str) else str(user_input)[:200]}")
         _log_detail({
             "event": "user_input",
             "content": user_input if isinstance(user_input, str) else "(multimodal)",
@@ -1632,40 +1675,98 @@ Don't repeat this if `bot_name` already exists in memory.
         
         # Flag to track if we should suppress conversational text
         # Always suppress in skill execution scenarios to prevent dialogue leakage
-        suppress_conversational_text = hasattr(self, '_current_skill_steps') and bool(self._current_skill_steps)
+        session_id_for_chat = self.session_id or "default"
+        current_chat_steps = self._current_skill_steps.get(session_id_for_chat, [])
+        suppress_conversational_text = bool(current_chat_steps)
+        logger.info(f"[Agent] Initial suppress_conversational_text: {suppress_conversational_text}")
         
-        # Check if user input suggests skill execution (troubleshooting, diagnosis, etc.)
-        # If so, proactively suppress conversational text from the start
-        user_input_lower = ""
+        # Check if we have an active skill with pending steps for this session
+        has_active_skill = bool(current_chat_steps)
+        
+        # Check if user provided IP info
+        has_ip_address = False
         if isinstance(user_input, str):
-            user_input_lower = user_input.lower()
+            import re
+            ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
+            has_ip_address = bool(re.search(ip_pattern, user_input))
         
-        troubleshooting_keywords = ['排查', '诊断', 'troubleshoot', 'diagnose', 'static route', '静态路由', '不通', 'not working']
-        has_troubleshooting_keywords = any(kw in user_input_lower for kw in troubleshooting_keywords)
+        logger.info(f"[Agent] Active skill check - has_active_skill={has_active_skill}, has_ip_address={has_ip_address}")
         
-        # Also detect IP address patterns which might indicate routing troubleshooting
+        # Initialize variables
+        has_troubleshooting_intent = False
+        llm_intent_result = None
+        llm_skill_name = None
+        
+        # Only call LLM for intent recognition if:
+        # 1. No active skill, OR
+        # 2. Active skill but no IP info provided yet
+        if not (has_active_skill and has_ip_address):
+            logger.info(f"[Agent] About to start LLM intent recognition, user_input type: {type(user_input)}, is string: {isinstance(user_input, str)}")
+            logger.info(f"[Agent] Starting LLM-based intent recognition for: {user_input[:100]}")
+            
+            if isinstance(user_input, str) and user_input.strip():
+                try:
+                    # Get available skills
+                    skills = self._registry.discover()
+                
+                    # Create intent recognizer
+                    intent_recognizer = IntentRecognizer(self.provider)
+                
+                    # Recognize intent using LLM
+                    intent, skill_name = intent_recognizer.recognize_intent(user_input, skills)
+                
+                    llm_intent_result = {"intent": intent, "skill": skill_name}
+                    llm_skill_name = skill_name
+                    logger.info(f"[Agent] LLM intent recognition: intent={intent}, skill={skill_name}")
+                    
+                    # If LLM recognizes troubleshooting intent, set flag
+                    if intent == "troubleshooting":
+                        has_troubleshooting_intent = True
+                        logger.info(f"[Agent] LLM detected troubleshooting intent")
+                
+                except Exception as e:
+                    logger.error(f"[Agent] LLM intent recognition failed: {e}")
+                    llm_intent_result = None
+        
+        # If LLM intent recognition failed, log warning but do NOT fallback to keyword matching
+        if not has_troubleshooting_intent:
+            logger.warning(f"[Agent] LLM did not detect troubleshooting intent. No keyword fallback will be used.")
+        
+        # If troubleshooting intent detected by LLM, enable text suppression
+        if has_troubleshooting_intent:
+            logger.info(f"[Agent] Detected troubleshooting intent via LLM, enabling text suppression")
+            suppress_conversational_text = True
+        
+        # Check if we should skip LLM and directly execute skill
+        # Case 1: Has active skill with pending steps and user provided IP info
+        # Case 2: LLM detected troubleshooting intent and selected a skill
+        # Check active skill for this session only
+        session_id_for_check = self.session_id or "default"
+        has_active_skill = bool(self._current_skill_steps.get(session_id_for_check, []))
         import re
         ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b'
         has_ip_address = bool(re.search(ip_pattern, user_input)) if isinstance(user_input, str) else False
         
-        # If either troubleshooting keywords or IP address found, consider it troubleshooting intent
-        if has_troubleshooting_keywords or has_ip_address:
-            logger.info(f"[Agent] Detected troubleshooting intent, enabling text suppression")
-            logger.info(f"[Agent]   has_troubleshooting_keywords: {has_troubleshooting_keywords}")
-            logger.info(f"[Agent]   has_ip_address: {has_ip_address}")
-            suppress_conversational_text = True
+        # Check if LLM selected a skill
+        llm_selected_skill = None
+        if llm_intent_result:
+            llm_selected_skill = llm_intent_result.get('skill')
         
-        # Check if we have an active skill with pending steps and user provided IP info
-        # If so, skip LLM and directly execute the next step
-        has_active_skill = hasattr(self, '_current_skill_steps') and self._current_skill_steps
-        if has_active_skill and has_ip_address:
-            logger.info(f"[Agent] Found active skill with steps and user provided IP info, skipping LLM, directly executing steps")
+        # Skip LLM if:
+        # 1. Has active skill with steps and user provided IP info, OR
+        # 2. LLM detected troubleshooting intent and selected a specific skill
+        should_skip_llm = (has_active_skill and has_ip_address) or (has_troubleshooting_intent and llm_selected_skill)
+        
+        if should_skip_llm:
+            logger.info(f"[Agent] Skipping LLM analysis - has_active_skill={has_active_skill}, has_ip_address={has_ip_address}, llm_selected_skill={llm_selected_skill}")
             
             # Import required classes
             from .llm.response import MockFunction, MockToolCall
             
-            # Create forced tool call for step execution
-            forced_tool_call = self._create_forced_tool_call()
+            # Create forced tool call
+            # If skill is already active, create step execution call
+            # If skill is not active but LLM selected a skill, create use_skill call to activate
+            forced_tool_call = self._create_forced_tool_call(llm_selected_skill)
             if forced_tool_call:
                 logger.info(f"[Agent] Force-created tool call for step execution: {forced_tool_call.function.name}")
                 
@@ -1708,22 +1809,62 @@ Don't repeat this if `bot_name` already exists in memory.
                     except Exception as _e:
                         logger.warning(f"[Agent] Failed to cache device_info/destination_network: {_e}")
                     
+                    # Send a message to user requesting supplementary information
+                    # This is needed because skill activation doesn't return step content
+                    if forced_tool_call.function.name == "use_skill":
+                        skill_name_for_prompt = forced_args.get("skill_name", "") if forced_args else ""
+                        if skill_name_for_prompt == "static-troubleshooting":
+                            prompt_message = {
+                                "answerType": "conversation",
+                                "contextEnd": "false",
+                                "contextId": "",
+                                "currentStep": 1,
+                                "message": "已启动静态路由故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 目的IP网段：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.0）",
+                                "questionNo": "",
+                                "sessionId": self.session_id or "default"
+                            }
+                            prompt_json = json.dumps(prompt_message, ensure_ascii=False)
+                            if on_token:
+                                logger.info("[Agent] Sending skill activation prompt to frontend")
+                                on_token(prompt_json)
+                            return prompt_json
+                        elif skill_name_for_prompt == "ethernet-port-troubleshooting":
+                            prompt_message = {
+                                "answerType": "conversation",
+                                "contextEnd": "false",
+                                "contextId": "",
+                                "currentStep": 1,
+                                "message": "已启动以太口故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 接口名称：格式为 GigabitEthernet x/x/x（例如：GigabitEthernet 1/0/1）",
+                                "questionNo": "",
+                                "sessionId": self.session_id or "default"
+                            }
+                            prompt_json = json.dumps(prompt_message, ensure_ascii=False)
+                            if on_token:
+                                logger.info("[Agent] Sending skill activation prompt to frontend")
+                                on_token(prompt_json)
+                            return prompt_json
+                    
                     # Send result to frontend and continue with next steps
                     if answer_type in ("stepContent", "stepAnalysis", "stepCommand"):
                         # Get current step info
                         current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
-                        if current_step_idx > 0 and current_step_idx <= len(self._current_skill_steps):
-                            current_step_name = self._current_skill_steps[current_step_idx - 1]
+                        
+                        # Get skill steps for this session
+                        session_steps = self._current_skill_steps.get(session_id_for_step, [])
+                        session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                        
+                        if current_step_idx > 0 and current_step_idx <= len(session_steps):
+                            current_step_name = session_steps[current_step_idx - 1]
                         else:
-                            current_step_name = self._current_skill_steps[0] if self._current_skill_steps else ""
+                            current_step_name = session_steps[0] if session_steps else ""
 
                         # 统一从 SKILL.md 解析的 _current_skill_step_numbers 取真实步骤号
                         # 该值是 stepName / stepCommand / stepContent 三条消息的唯一 currentStep 源
                         _idx_for_num = current_step_idx - 1 if current_step_idx > 0 else 0
-                        if 0 <= _idx_for_num < len(self._current_skill_step_numbers):
-                            _skill_step_num = self._current_skill_step_numbers[_idx_for_num]
+                        if 0 <= _idx_for_num < len(session_step_numbers):
+                            _skill_step_num = session_step_numbers[_idx_for_num]
                         else:
-                            _skill_step_num = self._current_skill_step_numbers[0] if self._current_skill_step_numbers else 1
+                            _skill_step_num = session_step_numbers[0] if session_step_numbers else 1
 
                         # 先把当前步骤名 [STEP_START]...[STEP_END] 推送给前端，
                         # 让前端先切换到新 step（清空旧 step 残留的展示），然后
@@ -1778,9 +1919,12 @@ Don't repeat this if `bot_name` already exists in memory.
                                         if match:
                                             next_step_number = int(match.group(1))
                                             try:
-                                                next_step_idx = self._current_skill_step_numbers.index(next_step_number)
-                                                if 0 <= next_step_idx < len(self._current_skill_steps):
-                                                    next_step_name = self._current_skill_steps[next_step_idx]
+                                                # Get skill steps for this session
+                                                session_steps = self._current_skill_steps.get(session_id_for_step, [])
+                                                session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                                                next_step_idx = session_step_numbers.index(next_step_number)
+                                                if 0 <= next_step_idx < len(session_steps):
+                                                    next_step_name = session_steps[next_step_idx]
                                                     logger.info(f"[Agent] Jumping to step {next_step_number}: {next_step_name}")
                                             except ValueError:
                                                 logger.warning(f"[Agent] Step number {next_step_number} not found in _current_skill_step_numbers")
@@ -1789,23 +1933,29 @@ Don't repeat this if `bot_name` already exists in memory.
                             
                             # If no next_step from analysis, use sequential execution
                             if not next_step_name:
+                                # Get skill steps for this session
+                                session_steps = self._current_skill_steps.get(session_id_for_step, [])
                                 current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
-                                if current_step_idx >= len(self._current_skill_steps):
+                                if current_step_idx >= len(session_steps):
                                     logger.info(f"[Agent] All steps completed")
-                                    self._current_skill_steps = []
-                                    self._current_skill_step_numbers = []
+                                    self._current_skill_steps.pop(session_id_for_step, None)
+                                    self._current_skill_step_numbers.pop(session_id_for_step, None)
+                                    self._current_skill_step_commands.pop(session_id_for_step, None)
                                     self._session_step_indices.pop(session_id_for_step, None)
                                     return "所有故障排查步骤执行完成。"
-                                next_step_name = self._current_skill_steps[current_step_idx]
-                                next_step_number = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
+                                next_step_name = session_steps[current_step_idx]
+                                session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                                next_step_number = session_step_numbers[current_step_idx] if current_step_idx < len(session_step_numbers) else current_step_idx + 1
                                 logger.info(f"[Agent] Executing next step sequentially: step {next_step_number}: {next_step_name}")
                             
                             # Check if this is the final step
-                            max_step_number = max(self._current_skill_step_numbers) if self._current_skill_step_numbers else 7
+                            session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                            max_step_number = max(session_step_numbers) if session_step_numbers else 7
                             if next_step_number == max_step_number or "流程结束" in next_step_name or "总结" in next_step_name:
                                 logger.info(f"[Agent] Reached final step {next_step_number}: {next_step_name}")
-                                self._current_skill_steps = []
-                                self._current_skill_step_numbers = []
+                                self._current_skill_steps.pop(session_id_for_step, None)
+                                self._current_skill_step_numbers.pop(session_id_for_step, None)
+                                self._current_skill_step_commands.pop(session_id_for_step, None)
                                 self._session_step_indices.pop(session_id_for_step, None)
                                 summary_text = (
                                     "静态路由故障排查完成。<br/><br/>"
@@ -1876,7 +2026,8 @@ Don't repeat this if `bot_name` already exists in memory.
                                 self._session_destination_network[session_id_for_step] = destination_network
                             
                             # Get commands from SKILL.md for this step
-                            skill_commands = self._current_skill_step_commands.get(next_step_number, [])
+                            session_step_commands = self._current_skill_step_commands.get(session_id_for_step, {})
+                            skill_commands = session_step_commands.get(next_step_number, [])
                             
                             next_step_params = {
                                 "step_name": next_step_name,
@@ -2122,14 +2273,16 @@ Don't repeat this if `bot_name` already exists in memory.
                                     logger.info("[Agent] Skill activation successful, starting step execution...")
                                 
                                 # Extract steps from the activated skill
-                                has_steps = hasattr(self, '_current_skill_steps') and self._current_skill_steps
+                                session_id_for_skill = self.session_id or "default"
+                                session_steps = self._current_skill_steps.get(session_id_for_skill, [])
+                                has_steps = bool(session_steps)
                                 logger.info(f"[Agent] Has steps attribute: {has_steps}")
                                 
                                 if has_steps:
-                                    logger.info(f"[Agent] Found {len(self._current_skill_steps)} steps to execute")
-                                    logger.info(f"[Agent] Steps list: {self._current_skill_steps}")
+                                    logger.info(f"[Agent] Found {len(session_steps)} steps to execute")
+                                    logger.info(f"[Agent] Steps list: {session_steps}")
                                     
-                                    first_step_name = self._current_skill_steps[0]
+                                    first_step_name = session_steps[0]
                                     
                                     # ── Step 0: 获取网络拓扑图（根据技能配置决定是否执行）──────────────────────
                                     # 在执行第一步排查脚本之前，先检查技能配置是否需要获取拓扑图
@@ -2228,11 +2381,13 @@ Don't repeat this if `bot_name` already exists in memory.
                                         logger.info(f"[Agent] Extracted device info: {device_info}")
                                         
                                         # Get actual step number from SKILL.md
-                                        actual_step_number = self._current_skill_step_numbers[0] if self._current_skill_step_numbers else 1
+                                        session_step_numbers = self._current_skill_step_numbers.get(session_id_for_skill, [])
+                                        session_step_commands = self._current_skill_step_commands.get(session_id_for_skill, {})
+                                        actual_step_number = session_step_numbers[0] if session_step_numbers else 1
                                         logger.info(f"[Agent] Actual step number from SKILL.md: {actual_step_number}")
                                         
                                         # Get commands from SKILL.md for this step
-                                        skill_commands = self._current_skill_step_commands.get(actual_step_number, [])
+                                        skill_commands = session_step_commands.get(actual_step_number, [])
                                         logger.info(f"[Agent] Commands from SKILL.md for step {actual_step_number}: {skill_commands}")
                                         
                                         step_params = {
@@ -2433,9 +2588,12 @@ Don't repeat this if `bot_name` already exists in memory.
                                                             next_step_number = int(match.group(1))
                                                             # Find the step name by looking for the step number in _current_skill_step_numbers
                                                             try:
-                                                                next_step_idx = self._current_skill_step_numbers.index(next_step_number)
-                                                                if 0 <= next_step_idx < len(self._current_skill_steps):
-                                                                    next_step_name = self._current_skill_steps[next_step_idx]
+                                                                # Get skill steps for this session
+                                                                session_steps = self._current_skill_steps.get(session_id_for_step, [])
+                                                                session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
+                                                                next_step_idx = session_step_numbers.index(next_step_number)
+                                                                if 0 <= next_step_idx < len(session_steps):
+                                                                    next_step_name = session_steps[next_step_idx]
                                                                     logger.info(f"[Agent] Jumping to step {next_step_number}: {next_step_name} (from {'analysis.next_step' if 'analysis' in current_parsed else 'nextStep'})")
                                                             except ValueError:
                                                                 logger.warning(f"[Agent] Step number {next_step_number} not found in _current_skill_step_numbers")
@@ -2444,14 +2602,18 @@ Don't repeat this if `bot_name` already exists in memory.
                                             
                                             # If no next_step from analysis, use sequential execution
                                             if not next_step_name:
+                                                # Get skill steps for this session
+                                                session_steps = self._current_skill_steps.get(session_id_for_step, [])
+                                                session_step_numbers = self._current_skill_step_numbers.get(session_id_for_step, [])
                                                 current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
-                                                if current_step_idx >= len(self._current_skill_steps):
+                                                if current_step_idx >= len(session_steps):
                                                     logger.info(f"[Agent] All steps completed, exiting step execution loop")
                                                     # Skill execution complete, clear skill state
                                                     # 在清空 _current_skill_step_numbers 之前先取出最大步骤号（来自 SKILL.md）
-                                                    _final_step_num = max(self._current_skill_step_numbers) if self._current_skill_step_numbers else 7
-                                                    self._current_skill_steps = []
-                                                    self._current_skill_step_numbers = []
+                                                    _final_step_num = max(session_step_numbers) if session_step_numbers else 7
+                                                    self._current_skill_steps.pop(session_id_for_step, None)
+                                                    self._current_skill_step_numbers.pop(session_id_for_step, None)
+                                                    self._current_skill_step_commands.pop(session_id_for_step, None)
                                                     self._session_step_indices.pop(session_id_for_step, None)
                                                     # Return completion message in conversation format
                                                     summary_text = (
@@ -2473,14 +2635,14 @@ Don't repeat this if `bot_name` already exists in memory.
                                                         logger.info("[Agent] Emitting final conversation summary to frontend (all steps completed)")
                                                         on_token(completion_json)
                                                     return completion_json
-                                                next_step_name = self._current_skill_steps[current_step_idx]
+                                                next_step_name = session_steps[current_step_idx]
                                                 # Get actual step number from SKILL.md
-                                                next_step_number = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
+                                                next_step_number = session_step_numbers[current_step_idx] if current_step_idx < len(session_step_numbers) else current_step_idx + 1
                                                 logger.info(f"[Agent] Executing next step sequentially: step {next_step_number}: {next_step_name}")
                                             else:
                                                 # Find the index of the step with this number
                                                 try:
-                                                    next_step_idx = self._current_skill_step_numbers.index(next_step_number)
+                                                    next_step_idx = session_step_numbers.index(next_step_number)
                                                     current_step_idx = next_step_idx
                                                 except ValueError:
                                                     # If not found, use the number directly
@@ -2555,7 +2717,8 @@ Don't repeat this if `bot_name` already exists in memory.
                                                 self._session_destination_network[session_id_for_step] = destination_network
                                             
                                             # Get commands from SKILL.md for this step
-                                            skill_commands = self._current_skill_step_commands.get(next_step_number, [])
+                                            session_step_commands = self._current_skill_step_commands.get(session_id_for_step, {})
+                                            skill_commands = session_step_commands.get(next_step_number, [])
                                             logger.info(f"[Agent] Commands from SKILL.md for step {next_step_number}: {skill_commands}")
                                             
                                             next_step_params = {
@@ -2808,12 +2971,15 @@ Don't repeat this if `bot_name` already exists in memory.
                     
                     if is_step_execution:
                         # Use independent counter for skill steps
-                        current_step_idx = min(skill_step_counter, len(self._current_skill_steps) - 1)
+                        session_id_for_skill = self.session_id or "default"
+                        session_steps = self._current_skill_steps.get(session_id_for_skill, [])
+                        session_step_numbers = self._current_skill_step_numbers.get(session_id_for_skill, [])
+                        current_step_idx = min(skill_step_counter, len(session_steps) - 1)
                         if current_step_idx >= 0:
-                            step_name = self._current_skill_steps[current_step_idx]
+                            step_name = session_steps[current_step_idx]
                             # 取真实步骤号嵌入 STEP_START 标记，确保 stepName cs 与 stepCommand/stepContent 一致
                             try:
-                                _cs_num = self._current_skill_step_numbers[current_step_idx] if current_step_idx < len(self._current_skill_step_numbers) else current_step_idx + 1
+                                _cs_num = session_step_numbers[current_step_idx] if current_step_idx < len(session_step_numbers) else current_step_idx + 1
                             except Exception:
                                 _cs_num = current_step_idx + 1
                             step_marker = f"[STEP_START:{_cs_num}]{step_name}[STEP_END]"

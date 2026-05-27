@@ -90,8 +90,11 @@ class PersistentAgent(Agent):
                         if skill:
                             step_pattern = r'\[STEP_START\](.*?)\[STEP_END\]'
                             steps = re.findall(step_pattern, skill.instructions)
-                            if steps and not hasattr(self, '_current_skill_steps'):
-                                self._current_skill_steps = steps
+                            if steps:
+                                session_id_for_skill = self.session_id or "default"
+                                if not hasattr(self, '_current_skill_steps'):
+                                    self._current_skill_steps = {}
+                                self._current_skill_steps[session_id_for_skill] = steps
                                 logger.info(
                                     "[PersistentAgent] Restored %d steps for skill '%s'",
                                     len(steps), skill_name
