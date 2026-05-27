@@ -269,19 +269,45 @@ def execute_step_script(script_name: str, mode: str, params: dict | str) -> str:
         # Determine script path - look in skill directories
         # Scripts are located in templates/skills/{category}/{skill_name}/
         skill_base = Path(__file__).parent.parent / "templates" / "skills"
+        logger.info(f"[execute_step_script] Skill base path: {skill_base}")
         
-        # Search for the script in all skill directories
+        # Get skill_name from params to find the correct script path
+        skill_name = params.get("skill_name", "")
+        logger.info(f"[execute_step_script] skill_name from params: '{skill_name}'")
         script_path = None
-        for category_dir in skill_base.iterdir():
-            if category_dir.is_dir():
-                for skill_dir in category_dir.iterdir():
-                    if skill_dir.is_dir():
-                        candidate = skill_dir / script_name
+        
+        # First, try to find the script in the specific skill directory
+        if skill_name:
+            logger.info(f"[execute_step_script] Attempting to find script in specific skill directory: {skill_name}")
+            for category_dir in skill_base.iterdir():
+                if category_dir.is_dir():
+                    logger.info(f"[execute_step_script] Checking category: {category_dir.name}")
+                    specific_skill_dir = category_dir / skill_name
+                    logger.info(f"[execute_step_script] Looking for specific skill dir: {specific_skill_dir}")
+                    if specific_skill_dir.is_dir():
+                        candidate = specific_skill_dir / script_name
+                        logger.info(f"[execute_step_script] Checking candidate: {candidate}")
                         if candidate.exists():
                             script_path = candidate
+                            logger.info(f"[execute_step_script] Found script at specific skill path: {script_path}")
                             break
-                if script_path:
-                    break
+                    else:
+                        logger.info(f"[execute_step_script] Specific skill dir does not exist: {specific_skill_dir}")
+        
+        # If not found with specific skill name, search in all skill directories (backward compatibility)
+        if not script_path:
+            logger.info(f"[execute_step_script] Script not found in specific skill dir, searching all skills...")
+            for category_dir in skill_base.iterdir():
+                if category_dir.is_dir():
+                    for skill_dir in category_dir.iterdir():
+                        if skill_dir.is_dir():
+                            candidate = skill_dir / script_name
+                            if candidate.exists():
+                                script_path = candidate
+                                logger.info(f"[execute_step_script] Found script in fallback search: {script_path}")
+                                break
+                    if script_path:
+                        break
         
         if not script_path:
             return json.dumps({"error": f"Script '{script_name}' not found in any skill directory"})

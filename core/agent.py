@@ -768,23 +768,44 @@ Don't repeat this if `bot_name` already exists in memory.
                 skill_names = [s.name for s in skills]
                 logger.info(f"[Agent] Available skill names: {skill_names}")
                 
-                # Prefer static-troubleshooting for static route issues
-                if 'static-troubleshooting' in skill_names:
-                    skill_name = 'static-troubleshooting'
-                    logger.info(f"[Agent] Selected skill: {skill_name}")
-                elif 'CT-AP-not-online-zhuwang' in skill_names:
-                    skill_name = 'CT-AP-not-online-zhuwang'
-                    logger.info(f"[Agent] Selected skill: {skill_name}")
-                else:
-                    # Find any troubleshooting skill by checking name field
-                    troubleshooting_skills = [s.name for s in skills if 'troubleshoot' in s.name.lower()]
-                    logger.info(f"[Agent] Troubleshooting skills found: {troubleshooting_skills}")
-                    if troubleshooting_skills:
-                        skill_name = troubleshooting_skills[0]
-                        logger.info(f"[Agent] Selected troubleshooting skill: {skill_name}")
+                # Skill selection based on keywords in user message
+                # Create a mapping of keywords to skill names
+                skill_keyword_map = [
+                    ('以太口', 'ethernet-port-troubleshooting'),
+                    ('端口', 'ethernet-port-troubleshooting'),
+                    ('接口', 'ethernet-port-troubleshooting'),
+                    ('static', 'static-troubleshooting'),
+                    ('静态路由', 'static-troubleshooting'),
+                    ('路由', 'static-troubleshooting'),
+                ]
+                
+                skill_name = None
+                
+                # Find the most specific skill based on user input
+                for keyword, target_skill in skill_keyword_map:
+                    if keyword in last_user_msg and target_skill in skill_names:
+                        skill_name = target_skill
+                        logger.info(f"[Agent] Selected skill '{skill_name}' based on keyword '{keyword}'")
+                        break
+                
+                # Fallback: prefer static-troubleshooting if no specific match
+                if skill_name is None:
+                    if 'static-troubleshooting' in skill_names:
+                        skill_name = 'static-troubleshooting'
+                        logger.info(f"[Agent] Selected skill: {skill_name} (fallback)")
+                    elif 'CT-AP-not-online-zhuwang' in skill_names:
+                        skill_name = 'CT-AP-not-online-zhuwang'
+                        logger.info(f"[Agent] Selected skill: {skill_name} (fallback)")
                     else:
-                        logger.warning("[Agent] No troubleshooting skills available")
-                        return None
+                        # Find any troubleshooting skill by checking name field
+                        troubleshooting_skills = [s.name for s in skills if 'troubleshoot' in s.name.lower()]
+                        logger.info(f"[Agent] Troubleshooting skills found: {troubleshooting_skills}")
+                        if troubleshooting_skills:
+                            skill_name = troubleshooting_skills[0]
+                            logger.info(f"[Agent] Selected troubleshooting skill: {skill_name}")
+                        else:
+                            logger.warning("[Agent] No troubleshooting skills available")
+                            return None
                 
                 logger.info(f"[Agent] Force-activating skill: {skill_name}")
                 arguments_json = json.dumps({"skill_name": skill_name})
