@@ -89,29 +89,25 @@ class IntentRecognizer:
     def _get_system_prompt(self) -> str:
         """获取系统提示词"""
         return """
-你是一个专业的网络故障排查意图分类器。
+你是一个专业的技能匹配助手。
 
 ## 任务要求
-根据用户输入，识别其意图并选择最适合的技能。
+根据用户输入，从可用技能列表中选择最匹配的一个。
 
 ## 输出格式
-你必须严格按照以下 JSON 格式输出，只输出 JSON，不输出任何其他内容：
-{"intent": "<意图类型>", "skill": "<技能名称>"}
+只输出一个JSON对象，不要输出任何其他内容：
+{"skill": "CT-ac-feiwlanganlao-troubleshooting"}
 
-## 意图类型定义
-- troubleshooting: 当用户询问"故障排查"、"诊断"、"排查"、"静态路由故障排查"、"以太口故障排查"、"端口不通"、"网络不通"等时，选择此意图
-- information: 当用户询问"查询"、"获取"、"显示"配置或状态信息时，选择此意图
-- configuration: 当用户要求"配置"、"修改"、"设置"网络设备参数时，选择此意图
-- unknown: 当无法确定用户意图时，选择此意图
+注意：必须将技能名称放在引号内，直接输出JSON对象。
 
 ## 响应要求
-- 只输出 JSON 格式，不要输出任何解释、思考过程或其他内容
-- JSON 必须可以被 json.loads() 直接解析
+- 只输出JSON格式，不要输出任何解释、思考过程或其他内容
+- JSON必须可以被json.loads()直接解析
+- 如果没有匹配的技能，输出 {"skill": ""}
 """
 
     def _build_intent_prompt(self, user_input: str, skill_info: str) -> str:
         """构建意图识别的用户提示词，动态包含技能名称和描述信息"""
-        output_format = '{"intent": "<意图类型>", "skill": "<技能名称>"}'
         return f"""
 用户输入：{user_input}
 
@@ -119,22 +115,16 @@ class IntentRecognizer:
 {skill_info}
 
 ## 技能选择规则
-1. 如果用户输入包含"故障排查"、"排查"、"诊断"等词，意图选择 troubleshooting
-2. 根据用户输入的具体内容，选择描述最匹配的技能
-3. 如果没有匹配的技能，返回空字符串 "" 作为 skill
+根据用户输入的具体内容，从可用技能列表中选择描述最匹配的技能。
 
-请根据用户输入，识别意图并选择最合适的技能。
-
-输出格式：
-{output_format}
+请直接输出JSON格式的技能名称，例如：{{"skill": "ethernet-port-troubleshooting"}}
 """
 
     def _parse_llm_response(self, response, available_skills: list) -> Tuple[str, str]:
         """
-        解析大模型响应，采用三段式解析策略：
+        解析大模型响应，采用两段式解析策略：
         1. JSON优先解析
-        2. 正则抽取（支持多种格式）
-        3. 基于关键词的兜底提取
+        2. 正则抽取
         """
         try:
             # 获取响应内容
@@ -145,63 +135,78 @@ class IntentRecognizer:
                 content = str(response)
 
             # 打印完整的大模型响应便于排查
-            logger.info(f"[IntentRecognizer] LLM response (full):\n{content}")
+            logger.info(f"[IntentRecognizer] ==================== LLM Response Start ====================")
+            logger.info(f"[IntentRecognizer] LLM原始输出:\n{content}")
+            logger.info(f"[IntentRecognizer] ==================== LLM Response End ====================")
 
-            # 阶段1: JSON优先解析
+            # 阶段1: JSON优先解析 - 增强容错性
+            logger.info(f"[IntentRecognizer] 阶段1: 尝试JSON解析...")
             try:
-                parsed = json.loads(content)
-                intent = parsed.get("intent", "unknown")
-                skill = parsed.get("skill", "")
-                logger.info(f"[IntentRecognizer] JSON parsed - intent: {intent}, skill: {skill}")
-                # 即使技能不在列表中，也返回意图（技能选择会在后面处理）
-                if self._validate_skill(skill, available_skills):
-                    logger.info(f"[IntentRecognizer] JSON解析成功 - 意图: {intent}, 技能: {skill}")
-                    return intent, skill
-                else:
-                    # 技能不在列表中，但意图是有效的
-                    if intent and intent != "unknown":
-                        logger.info(f"[IntentRecognizer] JSON解析成功，但技能不在列表中 - 意图: {intent}, 技能: {skill}")
-                        return intent, skill
-            except json.JSONDecodeError:
-                logger.debug("[IntentRecognizer] JSON解析失败，尝试正则抽取")
+                # 尝试多种JSON解析方式
+                parsed = None
 
-            # 阶段2: 正则抽取 - 支持多种格式
-            patterns = [
-                # 标准JSON格式: "intent": "xxx", "skill": "xxx"
-                (r'"intent"\s*[：:]\s*["\']([^"\']+)["\']', r'"skill"\s*[：:]\s*["\']([^"\']+)["\']'),
-                # 中文引号格式: "意图": "xxx", "技能": "xxx"
-                (r'"意图"\s*[：:]\s*["\']([^"\']+)["\']', r'"技能"\s*[：:]\s*["\']([^"\']+)["\']'),
-                # 解释文本中的格式: intent可以设为"xxx", skill设为"xxx"
-                (r'intent[可以设为合适选择]*[：:\s]*["\']([^"\']+)["\']', r'skill[可以设为合适选择]*[：:\s]*["\']([^"\']+)["\']'),
-            ]
+                # 方式1: 直接解析
+                try:
+                    parsed = json.loads(content.strip())
+                    logger.info(f"[IntentRecognizer] 方式1直接解析成功")
+                except json.JSONDecodeError:
+                    logger.debug("[IntentRecognizer] 方式1直接解析失败，尝试方式2")
 
-            for intent_pattern, skill_pattern in patterns:
-                intent_match = re.search(intent_pattern, content, re.IGNORECASE)
-                skill_match = re.search(skill_pattern, content, re.IGNORECASE)
-                
-                if intent_match and skill_match:
-                    intent = intent_match.group(1) if intent_match.lastindex else intent_match.group(0)
-                    skill = skill_match.group(1) if skill_match.lastindex else skill_match.group(0)
-                    logger.info(f"[IntentRecognizer] 正则抽取成功 - 意图: {intent}, 技能: {skill}")
-                    
-                    # 白名单校验
+                # 方式2: 提取所有 {"skill": "xxx"} 格式的JSON，取最后一个（通常LLM最后输出的才是正确答案）
+                if parsed is None:
+                    json_patterns = [
+                        r'\{"skill"\s*:\s*"([^"]+)"\}',  # {"skill": "xxx"}
+                        r'\{"skill"\s*:\s*\'([^\']+)\'\}',  # {"skill": 'xxx'}
+                    ]
+                    best_match = None
+                    for pattern in json_patterns:
+                        matches = re.findall(pattern, content)
+                        if matches:
+                            # 取最后一个匹配（通常是最终输出）
+                            best_match = matches[-1]
+                            logger.info(f"[IntentRecognizer] 方式2找到匹配: {matches}, 使用最后一个: {best_match}")
+                            break
+
+                    if best_match:
+                        try:
+                            test_json = '{"skill": "' + best_match + '"}'
+                            parsed = json.loads(test_json)
+                            logger.info(f"[IntentRecognizer] 方式2正则提取JSON成功: {test_json}")
+                        except Exception as e:
+                            logger.debug(f"[IntentRecognizer] 方式2正则提取JSON失败: {e}")
+
+                if parsed:
+                    skill = parsed.get("skill", "")
+                    logger.info(f"[IntentRecognizer] JSON解析结果: skill='{skill}'")
                     if self._validate_skill(skill, available_skills):
-                        return intent, skill
-                    # 即使技能校验失败，也尝试返回有效意图
-                    if 'troubleshoot' in intent.lower():
-                        return 'troubleshooting', skill
+                        logger.info(f"[IntentRecognizer] ✓ JSON解析成功，技能验证通过: {skill}")
+                        return "troubleshooting", skill
+                    else:
+                        logger.warning(f"[IntentRecognizer] ✗ JSON解析成功，但技能不在列表中: {skill}")
+                        logger.info(f"[IntentRecognizer] 可用技能列表: {[s.name for s in available_skills]}")
+                        return "troubleshooting", skill
+                else:
+                    logger.debug("[IntentRecognizer] 无法从响应中提取JSON")
 
-            # 阶段3: 基于关键词的兜底提取
-            # 检查是否提到了 troubleshooting 相关内容
-            if 'troubleshoot' in content.lower() or '故障排查' in content:
-                # 查找最可能的技能
-                if 'static' in content.lower() and 'static-troubleshooting' in str([s.name for s in available_skills]):
-                    return 'troubleshooting', 'static-troubleshooting'
-                if 'ethernet' in content.lower() or '端口' in content or '接口' in content:
-                    if 'ethernet-port-troubleshooting' in str([s.name for s in available_skills]):
-                        return 'troubleshooting', 'ethernet-port-troubleshooting'
+            except Exception as e:
+                logger.error(f"[IntentRecognizer] JSON解析异常: {e}")
 
-            logger.warning(f"[IntentRecognizer] 无法从响应中提取有效意图和技能")
+            # 阶段2: 穷举法 - 提取所有可能的技能名称，逐一验证
+            logger.info(f"[IntentRecognizer] 阶段2: 穷举法提取所有可能技能...")
+            available_names = [getattr(s, 'name', '') for s in available_skills]
+            logger.info(f"[IntentRecognizer] 可用技能白名单: {available_names}")
+
+            # 提取所有引号内的值，逐一检查是否在技能列表中
+            all_quoted = re.findall(r'"([^"]+)"', content)
+            logger.info(f"[IntentRecognizer] 所有引号内容: {all_quoted}")
+
+            # 从后往前找（通常LLM最后输出的才是正确答案）
+            for candidate in reversed(all_quoted):
+                if candidate in available_names:
+                    logger.info(f"[IntentRecognizer] ✓ 穷举法找到有效技能: {candidate}")
+                    return "troubleshooting", candidate
+
+            logger.warning(f"[IntentRecognizer] ✗ 无法从响应中提取有效技能")
 
         except Exception as e:
             logger.error(f"[IntentRecognizer] 解析响应失败: {e}")

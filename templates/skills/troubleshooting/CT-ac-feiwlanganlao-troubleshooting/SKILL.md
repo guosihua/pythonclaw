@@ -27,22 +27,107 @@ transferRule: 对话>5轮 或 用户转人工 → 收集姓名、联系方式、
 先检查AP空口利用率是否具备非WLAN干扰特征，再通过滤波器、频谱分析仪、现场环境检查验证。
 
 ## 二、排查步骤与命令
-### 1. 查看AP 2.4G空口利用率
-- 进入隐藏模式：`[H3C] probe
+### **第1步：查看AP 2.4G空口利用率**
+[STEP_START]查看AP 2.4G空口利用率[STEP_END]
+
+**立即执行**：调用 `execute_step_script` 工具
+
+**工具参数**：
+```json
+{
+  "script_name": "step_executor.py",
+  "mode": "build_and_execute",
+  "params": {
+    "commands": [
+      "system-view",
+      "probe",
+      "display ar5 2 channelbusy"
+    ],
+    "analysis_type": "check_channel_busy"
+  }
+}
+```
+
+- 进入系统模式命令：`system-view`
+- 进入隐藏模式命令：`[H3C] probe`
 - 查看命令：`[H3C-probe] display ar5 2 channelbusy`
 - 检查项：CtlBusy、TxBusy、RxBusy、ExtBusy
 
-### 2. 空口利用率判断
+### **第2步：空口利用率判断**
+[STEP_START]空口利用率判断[STEP_END]
+
+**立即执行**：调用 `execute_step_script` 工具
+
+**工具参数**：
+```json
+{
+  "script_name": "step_executor.py",
+  "mode": "build_and_execute",
+  "params": {
+    "commands": [],
+    "analysis_type": "check_channel_busy"
+  }
+}
+```
+
 - 规则：CtlBusy > 60% → ❌异常；≤60% → ✅正常
 
-### 3. WLAN同频干扰判断
+### **第3步：WLAN同频干扰判断**
+[STEP_START]WLAN同频干扰判断[STEP_END]
+
+**立即执行**：调用 `execute_step_script` 工具
+
+**工具参数**：
+```json
+{
+  "script_name": "step_executor.py",
+  "mode": "build_and_execute",
+  "params": {
+    "commands": [],
+    "analysis_type": "check_channel_busy"
+  }
+}
+```
+
 - 规则：CtlBusy > 60% 且 RxBusy > 60% → ❌异常
 - 处理：按《无线通用优化规范》优化
 
-### 4. 非WLAN干扰判断
+### **第4步：非WLAN干扰判断**
+[STEP_START]非WLAN干扰判断[STEP_END]
+
+**立即执行**：调用 `execute_step_script` 工具
+
+**工具参数**：
+```json
+{
+  "script_name": "step_executor.py",
+  "mode": "build_and_execute",
+  "params": {
+    "commands": [],
+    "analysis_type": "check_channel_busy"
+  }
+}
+```
+
 - 规则：CtlBusy − (TxBusy + RxBusy) > 30% → ❌异常
 
-### 5. 非WLAN干扰验证（三选一）
+### **第5步：非WLAN干扰验证**
+[STEP_START]非WLAN干扰验证[STEP_END]
+
+**立即执行**：调用 `execute_step_script` 工具
+
+**工具参数**：
+```json
+{
+  "script_name": "step_executor.py",
+  "mode": "build_and_execute",
+  "params": {
+    "commands": [],
+    "analysis_type": "check_channel_busy"
+  }
+}
+```
+
 1. 频谱分析仪：扫描1.8G–2.4G，存在强电磁波 → ❌异常
 2. 滤波器：加装后空口利用率明显下降 → ❌异常
 3. 现场检查：微波炉、运营商4G天线等 → ❌异常

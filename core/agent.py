@@ -27,6 +27,7 @@ import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime
+from typing import Dict, Any
 
 from .. import config
 from .compaction import (
@@ -306,6 +307,7 @@ class Agent:
         self.loaded_skill_names: set[str] = set()
         self.pending_injections: list[str] = []
         self._session_step_indices: dict[str, int] = {}  # Track step progress per session
+        self._current_skill_name: dict[str, str] = {}  # Store current skill name per session
         self._current_skill_steps: dict[str, list[str]] = {}  # Store current skill's steps per session
         self._current_skill_step_numbers: dict[str, list[int]] = {}  # Store actual step numbers from SKILL.md per session
         self._current_skill_step_commands: dict[str, dict[int, list[str]]] = {}  # Store commands for each step from SKILL.md per session (key: step_number)
@@ -705,20 +707,33 @@ Don't repeat this if `bot_name` already exists in memory.
                 if has_ip:
                     logger.info(f"[Agent] User provided supplementary info, creating step execution")
                     # Create execute_step_script call to continue with the steps
-                    skill_name = 'static-troubleshooting'  # Default to static-troubleshooting
-                    analysis_type = 'check_route'  # Default analysis type
                     
-                    # Extract destination network from user message
+                    # Get current skill name for this session
+                    session_id_for_step = self.session_id or "default"
+                    skill_name = self._current_skill_name.get(session_id_for_step, 'static-troubleshooting')
+                    logger.info(f"[Agent] Using skill name from session: {skill_name}")
+                    
+                    # Set analysis_type based on skill type
+                    analysis_type = 'check_route'  # Default for static-troubleshooting
+                    if skill_name == 'ethernet-port-troubleshooting':
+                        analysis_type = 'check_port_status'
+                    elif skill_name == 'CT-ac-feiwlanganlao-troubleshooting':
+                        analysis_type = 'check_channel_busy'
+                    
+                    logger.info(f"[Agent] Using analysis_type: {analysis_type}")
+                    
+                    # Extract destination network from user message (only for static-troubleshooting)
                     destination_network = "0.0.0.0/0"
-                    dest_keyword_match = re.search(r'(目的网段|目标网段|目的IP)\s*[：:]?\s*([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)', last_user_msg)
-                    if dest_keyword_match:
-                        destination_network = dest_keyword_match.group(2)
-                        logger.info(f"[Agent] Extracted destination_network: {destination_network}")
-                    else:
-                        ip_matches = re.findall(ip_pattern, last_user_msg)
-                        if ip_matches:
-                            destination_network = ip_matches[-1]
-                            logger.info(f"[Agent] Using last IP as destination: {destination_network}")
+                    if skill_name == 'static-troubleshooting':
+                        dest_keyword_match = re.search(r'(目的网段|目标网段|目的IP)\s*[：:]?\s*([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?:/[0-9]{1,2})?)', last_user_msg)
+                        if dest_keyword_match:
+                            destination_network = dest_keyword_match.group(2)
+                            logger.info(f"[Agent] Extracted destination_network: {destination_network}")
+                        else:
+                            ip_matches = re.findall(ip_pattern, last_user_msg)
+                            if ip_matches:
+                                destination_network = ip_matches[-1]
+                                logger.info(f"[Agent] Using last IP as destination: {destination_network}")
                     
                     # Extract device info
                     device_info = self._extract_device_info_from_context()
@@ -1088,12 +1103,16 @@ Don't repeat this if `bot_name` already exists in memory.
             return None
         
         # Split instructions into step sections using step number headers
-        # Match "### **第N步" or "### **第中文步" or "### Step N" headers
-        section_pattern = r'###\s*\*?\*?(?:第(\d+)步|第([一二三四五六七八九十]{1,3})步|Step\s+(\d+))'
+        # Match "### **第N步" or "### **第中文步" or "### Step N" headers or "### N." format
+        section_pattern = r'###\s*\*?\*?(?:第(\d+)步：?|第([一二三四五六七八九十]{1,3})步：?|Step\s+(\d+)：?|(\d+)\.)'
         section_matches = list(re.finditer(section_pattern, instructions))
         
         for i, match in enumerate(section_matches):
-            step_num = parse_step_num(match.group(1), match.group(2), match.group(3))
+            # Handle four capture groups: 1=阿拉伯数字步, 2=中文数字步, 3=Step 数字, 4=数字加点
+            arabic = match.group(1) or match.group(4)  # 第1组或第4组
+            chinese = match.group(2)
+            english = match.group(3)
+            step_num = parse_step_num(arabic, chinese, english)
             if step_num is None:
                 continue
             
@@ -1131,6 +1150,39 @@ Don't repeat this if `bot_name` already exists in memory.
                 result[step_num] = [str(c) for c in commands]
         
         return result
+
+    def _generate_skill_activation_prompt(self, skill_name: str) -> Dict[str, Any]:
+        """
+        Generate a generic prompt for skill activation.
+        This replaces hardcoded prompts for each skill.
+        
+        Args:
+            skill_name: Name of the skill being activated
+            
+        Returns:
+            Dictionary with prompt message structure
+        """
+        # Default generic prompt
+        generic_message = f"已启动技能 '{skill_name}'，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）"
+        
+        # Skill-specific prompts (maintain backward compatibility)
+        skill_prompts = {
+            "static-troubleshooting": "已启动静态路由故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 目的IP网段：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.0）",
+            "ethernet-port-troubleshooting": "已启动以太口故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 接口名称：格式为 GigabitEthernet x/x/x（例如：GigabitEthernet 1/0/1）",
+            "CT-ac-feiwlanganlao-troubleshooting": "已启动无线非WLAN干扰问题排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）"
+        }
+        
+        message = skill_prompts.get(skill_name, generic_message)
+        
+        return {
+            "answerType": "conversation",
+            "contextEnd": "false",
+            "contextId": "",
+            "currentStep": 1,
+            "message": message,
+            "questionNo": "",
+            "sessionId": self.session_id or "default"
+        }
 
     def _use_skill(self, skill_name: str) -> str:
         """
@@ -1266,6 +1318,7 @@ Don't repeat this if `bot_name` already exists in memory.
             
             # Store steps with their actual numbers per session
             session_id_for_skill = self.session_id or "default"
+            self._current_skill_name[session_id_for_skill] = skill_name  # Store current skill name
             self._current_skill_steps[session_id_for_skill] = steps
             self._current_skill_step_numbers[session_id_for_skill] = [step_name_to_number.get(step, idx + 1) for idx, step in enumerate(steps)]
             logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
@@ -1277,6 +1330,7 @@ Don't repeat this if `bot_name` already exists in memory.
         elif steps:
             # Fallback: use sequential numbering if no step numbers found
             session_id_for_skill = self.session_id or "default"
+            self._current_skill_name[session_id_for_skill] = skill_name  # Store current skill name
             self._current_skill_steps[session_id_for_skill] = steps
             self._current_skill_step_numbers[session_id_for_skill] = list(range(1, len(steps) + 1))
             logger.info("[SkillSteps] Extracted %d steps from skill '%s': %s", len(steps), skill_name, steps[:3])
@@ -1286,6 +1340,7 @@ Don't repeat this if `bot_name` already exists in memory.
             )
         else:
             session_id_for_skill = self.session_id or "default"
+            self._current_skill_name[session_id_for_skill] = skill_name  # Store current skill name
             self._current_skill_steps[session_id_for_skill] = []
             self._current_skill_step_numbers[session_id_for_skill] = []
             self._current_skill_step_commands[session_id_for_skill] = {}
@@ -1781,18 +1836,23 @@ Don't repeat this if `bot_name` already exists in memory.
                     # Parse the result
                     answer_type = None
                     parsed_result = None
-                    try:
-                        import json as _json
-                        if isinstance(step_result, str):
-                            parsed_result = _json.loads(step_result)
-                            answer_type = parsed_result.get("answerType")
-                            logger.info(f"[Agent] Parsed step result - answer_type: {answer_type}")
-                    except Exception as e:
-                        logger.error(f"[Agent] Failed to parse step result: {e}")
                     
-                    # Update step index
+                    # Skip JSON parsing for use_skill tool calls (they return plain text)
+                    if forced_tool_call.function.name == "use_skill":
+                        logger.info("[Agent] Skipping JSON parsing for use_skill result")
+                    else:
+                        try:
+                            import json as _json
+                            if isinstance(step_result, str):
+                                parsed_result = _json.loads(step_result)
+                                answer_type = parsed_result.get("answerType")
+                                logger.info(f"[Agent] Parsed step result - answer_type: {answer_type}")
+                        except Exception as e:
+                            logger.error(f"[Agent] Failed to parse step result: {e}")
+                    
+                    # Update step index - start from 0 for first step
                     session_id_for_step = self.session_id or "default"
-                    self._session_step_indices[session_id_for_step] = 1
+                    self._session_step_indices[session_id_for_step] = 0
                     
                     # Cache device_info and destination_network from forced_tool_call args for reuse
                     try:
@@ -1813,36 +1873,14 @@ Don't repeat this if `bot_name` already exists in memory.
                     # This is needed because skill activation doesn't return step content
                     if forced_tool_call.function.name == "use_skill":
                         skill_name_for_prompt = forced_args.get("skill_name", "") if forced_args else ""
-                        if skill_name_for_prompt == "static-troubleshooting":
-                            prompt_message = {
-                                "answerType": "conversation",
-                                "contextEnd": "false",
-                                "contextId": "",
-                                "currentStep": 1,
-                                "message": "已启动静态路由故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 目的IP网段：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.0）",
-                                "questionNo": "",
-                                "sessionId": self.session_id or "default"
-                            }
-                            prompt_json = json.dumps(prompt_message, ensure_ascii=False)
-                            if on_token:
-                                logger.info("[Agent] Sending skill activation prompt to frontend")
-                                on_token(prompt_json)
-                            return prompt_json
-                        elif skill_name_for_prompt == "ethernet-port-troubleshooting":
-                            prompt_message = {
-                                "answerType": "conversation",
-                                "contextEnd": "false",
-                                "contextId": "",
-                                "currentStep": 1,
-                                "message": "已启动以太口故障排查流程，请提供以下信息：<br/><br/>- 设备IP地址：格式为 xxx.xxx.xxx.xxx（例如：192.168.1.1）<br/>- 接口名称：格式为 GigabitEthernet x/x/x（例如：GigabitEthernet 1/0/1）",
-                                "questionNo": "",
-                                "sessionId": self.session_id or "default"
-                            }
-                            prompt_json = json.dumps(prompt_message, ensure_ascii=False)
-                            if on_token:
-                                logger.info("[Agent] Sending skill activation prompt to frontend")
-                                on_token(prompt_json)
-                            return prompt_json
+                        
+                        # Generate generic skill activation prompt
+                        prompt_message = self._generate_skill_activation_prompt(skill_name_for_prompt)
+                        prompt_json = json.dumps(prompt_message, ensure_ascii=False)
+                        if on_token:
+                            logger.info(f"[Agent] Sending skill activation prompt for '{skill_name_for_prompt}' to frontend")
+                            on_token(prompt_json)
+                        return prompt_json
                     
                     # Send result to frontend and continue with next steps
                     if answer_type in ("stepContent", "stepAnalysis", "stepCommand"):
@@ -1938,6 +1976,7 @@ Don't repeat this if `bot_name` already exists in memory.
                                 current_step_idx = self._session_step_indices.get(session_id_for_step, 0)
                                 if current_step_idx >= len(session_steps):
                                     logger.info(f"[Agent] All steps completed")
+                                    self._current_skill_name.pop(session_id_for_step, None)
                                     self._current_skill_steps.pop(session_id_for_step, None)
                                     self._current_skill_step_numbers.pop(session_id_for_step, None)
                                     self._current_skill_step_commands.pop(session_id_for_step, None)
@@ -1953,6 +1992,7 @@ Don't repeat this if `bot_name` already exists in memory.
                             max_step_number = max(session_step_numbers) if session_step_numbers else 7
                             if next_step_number == max_step_number or "流程结束" in next_step_name or "总结" in next_step_name:
                                 logger.info(f"[Agent] Reached final step {next_step_number}: {next_step_name}")
+                                self._current_skill_name.pop(session_id_for_step, None)
                                 self._current_skill_steps.pop(session_id_for_step, None)
                                 self._current_skill_step_numbers.pop(session_id_for_step, None)
                                 self._current_skill_step_commands.pop(session_id_for_step, None)
@@ -2611,6 +2651,7 @@ Don't repeat this if `bot_name` already exists in memory.
                                                     # Skill execution complete, clear skill state
                                                     # 在清空 _current_skill_step_numbers 之前先取出最大步骤号（来自 SKILL.md）
                                                     _final_step_num = max(session_step_numbers) if session_step_numbers else 7
+                                                    self._current_skill_name.pop(session_id_for_step, None)
                                                     self._current_skill_steps.pop(session_id_for_step, None)
                                                     self._current_skill_step_numbers.pop(session_id_for_step, None)
                                                     self._current_skill_step_commands.pop(session_id_for_step, None)
